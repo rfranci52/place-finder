@@ -444,6 +444,9 @@ def load(args) -> None:
     boroughs = json.loads(boroughs_path().read_text())
 
     with psycopg.connect(owner_dsn(args), autocommit=True, prepare_threshold=None, connect_timeout=15) as conn:
+        # PostGIS and pg_trgm are installed in the gis schema (see db/schema.sql). This is a direct,
+        # unpooled connection, so a session setting holds for the whole load.
+        conn.execute("SET search_path = places, gis, public")
         exists = dict(conn.execute(
             "SELECT c.relname, true FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
             "WHERE n.nspname = 'places' AND c.relname IN ('places', 'places_staging', 'places_previous')"

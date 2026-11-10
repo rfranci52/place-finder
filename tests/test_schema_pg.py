@@ -181,6 +181,33 @@ def test_the_app_role_reads_the_public_data(pg):
         assert conn.execute("show statement_timeout").fetchone()[0] == "5s"
 
 
+def test_the_app_role_finds_the_extensions_without_qualifying_them(pg):
+    # PostGIS and pg_trgm are installed in the gis schema; places_app's role setting puts it on the path.
+    with psycopg.connect(pg["app"], autocommit=True) as conn:
+        assert conn.execute("select st_x(st_makepoint(1, 2))").fetchone()[0] == 1
+        assert conn.execute("select similarity('pizza', 'pizzeria') > 0").fetchone()[0] is True
+
+
+def test_other_roles_in_the_shared_database_cannot_reach_the_extensions(pg, owner):
+    # Stands in for another project's read-only role in the same database (the live one shares it
+    # with a demo that runs model-written SQL). The extension schema must be closed to it.
+    password = secrets.token_urlsafe(16)
+    owner.execute(psycopg.sql.SQL(
+        "do $$ begin if not exists (select 1 from pg_roles where rolname = 'places_other') then "
+        "create role places_other login; end if; end $$"
+    ))
+    owner.execute(psycopg.sql.SQL("alter role places_other password {}").format(psycopg.sql.Literal(password)))
+    dbname = urlsplit(pg["owner"]).path.lstrip("/")
+    with psycopg.connect(_dsn(dbname, "places_other", password), autocommit=True) as conn:
+        for statement in ("select gis.st_astext(gis.st_makepoint(1, 2))",
+                          "select gis.similarity('a', 'b')",
+                          "select count(*) from gis.spatial_ref_sys"):
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(statement)
+        with pytest.raises(psycopg.errors.UndefinedFunction):
+            conn.execute("select st_makepoint(1, 2)")
+
+
 def test_setup_script_grant_check_passes(pg, owner):
     setup = load_module(ROOT / "scripts" / "setup_db.py", "place_setup_for_pg_tests")
     assert setup.verify(owner) == []

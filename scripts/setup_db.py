@@ -154,6 +154,17 @@ def verify(conn) -> list[str]:
             ).fetchone()[0]
             if has != (grantee == ROLE and function in FUNCTIONS):
                 problems.append(f"{grantee}: unexpected execute state on {function}")
+    # The extensions' schema is for places_app only; no other role in the shared database may use it.
+    others = conn.execute(
+        "select coalesce(string_agg(rolname, ', ' order by rolname), '') from pg_roles "
+        "where rolcanlogin and has_schema_privilege(oid, 'gis', 'usage') and not rolsuper and rolname <> %s "
+        "and not pg_has_role(oid, (select nspowner from pg_namespace where nspname = 'gis'), 'member')",
+        (ROLE,),
+    ).fetchone()[0]
+    if others:
+        problems.append(f"gis schema usable by other roles: {others}")
+    if conn.execute("select has_schema_privilege('public', 'gis', 'usage')").fetchone()[0]:
+        problems.append("gis schema usable by public")
     # Postgres spells signatures its own way ("integer", not "int"), so compare its spelling.
     canonical = {f: conn.execute("select %s::regprocedure::text", (f,)).fetchone()[0]
                  for f in FUNCTIONS + INTERNAL_FUNCTIONS}

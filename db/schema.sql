@@ -7,8 +7,18 @@
 -- everything else it does goes through the security definer functions below, which hold the
 -- rules: how long geocodes are cached, how big that cache can grow, and the daily limits.
 
-create extension if not exists postgis;
-create extension if not exists pg_trgm;
+-- PostGIS and pg_trgm live in their own schema, which only places_app may use. This database is
+-- shared with other projects, one of which runs model-written SQL as a read-only role, and that
+-- role must not gain hundreds of spatial and text functions from an extension installed in public.
+create schema if not exists gis;
+revoke all on schema gis from public;
+create extension if not exists postgis schema gis;
+create extension if not exists pg_trgm schema gis;
+
+-- The rest of this file finds the extension types and operator classes here. SET LOCAL keeps the
+-- setting inside this run's transaction, so it cannot linger on a pooled connection afterward.
+-- (places_app gets the same path as a role setting further down.)
+set local search_path = places, gis, public;
 
 create schema if not exists places;
 revoke all on schema places from public;
@@ -25,6 +35,8 @@ $$;
 alter role places_app set statement_timeout = '5s';
 alter role places_app set lock_timeout = '2s';
 alter role places_app set idle_in_transaction_session_timeout = '10s';
+-- A role setting reaches pooled sessions too, unlike a startup options parameter.
+alter role places_app set search_path = places, gis;
 
 -- ------------------------------------------------------------------ reference data
 
@@ -216,6 +228,7 @@ $$;
 revoke all on all functions in schema places from public, places_app;
 
 grant usage on schema places to places_app;
+grant usage on schema gis to places_app;
 grant execute on function places.geocode_get(text) to places_app;
 grant execute on function places.geocode_put(text, boolean, double precision, double precision, text) to places_app;
 grant execute on function places.take_slot(text, text, int, int) to places_app;
