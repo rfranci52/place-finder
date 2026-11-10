@@ -1,0 +1,22 @@
+[project]
+name = "place-finder"
+version = "1.0.0"
+description = "Find nearby places from OpenStreetMap: a Vercel Python function with Postgres caching, pacing and daily limits, and a React map."
+requires-python = ">=3.12"
+# Runtime dependency of frontend/api/search.py. Vercel installs it from frontend/requirements.txt.
+dependencies = ["psycopg[binary]>=3.1,<4"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "hypothesis>=6.100",
+  # Lets the local dev server verify HTTPS certificates with a Python that has no system store.
+  "certifi",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

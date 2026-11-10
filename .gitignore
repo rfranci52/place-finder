@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.hypothesis/
+
+# Node
+node_modules/
+dist/
+
+# Secrets and local settings never live in the repository
+.env
+.env.*
+!.env.example
+
+# Tooling
+.vercel/
+.DS_Store
