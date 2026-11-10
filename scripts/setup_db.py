@@ -158,7 +158,11 @@ def verify(conn) -> list[str]:
     others = conn.execute(
         "select coalesce(string_agg(rolname, ', ' order by rolname), '') from pg_roles "
         "where rolcanlogin and has_schema_privilege(oid, 'gis', 'usage') and not rolsuper and rolname <> %s "
-        "and not pg_has_role(oid, (select nspowner from pg_namespace where nspname = 'gis'), 'member')",
+        "and not pg_has_role(oid, (select nspowner from pg_namespace where nspname = 'gis'), 'member') "
+        # Neon's own administration logins (members of neon_superuser) are the platform, not
+        # another project's role; on plain Postgres this group does not exist and nothing changes.
+        "and not exists (select 1 from pg_roles s where s.rolname = 'neon_superuser' "
+        "and pg_has_role(pg_roles.oid, s.oid, 'member'))",
         (ROLE,),
     ).fetchone()[0]
     if others:
