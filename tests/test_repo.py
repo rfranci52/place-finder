@@ -50,13 +50,13 @@ def test_vercel_headers():
     csp = headers["Content-Security-Policy-Report-Only"]
     assert "img-src 'self' data: https://tile.openstreetmap.org;" in csp
     assert "connect-src 'self';" in csp and "frame-ancestors 'none'" in csp
-    assert config["functions"]["api/search.py"]["maxDuration"] == 30
+    assert config["functions"]["api/search.py"]["maxDuration"] == 15
 
 
 def test_the_function_is_self_contained():
     """Vercel does not reliably bundle sibling modules, so search.py imports only stdlib and psycopg."""
     source = (ROOT / "frontend" / "api" / "search.py").read_text(encoding="utf-8")
-    imports = set(re.findall(r"^\s*(?:import|from) ([\w.]+)", source, re.M))
+    imports = {a or b for a, b in re.findall(r"^\s*(?:import ([\w.]+)|from ([\w.]+) import )", source, re.M)}
     third_party = {name.split(".")[0] for name in imports} - set(__import__("sys").stdlib_module_names)
     assert third_party == {"psycopg"}
     requirements = (ROOT / "frontend" / "requirements.txt").read_text(encoding="utf-8")

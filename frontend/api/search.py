@@ -1,28 +1,20 @@
-"""Place search: POST /api/search.
+"""Place search across New York City's five boroughs: POST /api/search.
 
-A Vercel Python function in one self-contained file (standard library plus
-psycopg), because Vercel does not reliably bundle sibling modules. It turns a
-search term plus a location into nearby places from OpenStreetMap:
+A Vercel Python function in one self-contained file (standard library plus psycopg), because
+Vercel does not reliably bundle sibling modules. It turns a search term plus a location into
+the nearest matching places:
 
-1. Nominatim turns the location text into coordinates.
-2. The Overpass API returns matching places around that point.
+1. A typed location is matched against NYC's own neighborhood and park names first (loaded from
+   NYC Open Data). Anything else, typically a street address, goes to NYC GeoSearch, the City's
+   free geocoder (NYC Department of City Planning, https://geosearch.planninglabs.nyc), and the
+   answer is cached in Postgres for 30 days.
+2. A point outside the five boroughs is refused with out_of_area.
+3. One parameterized PostGIS query finds the 60 nearest matches within the radius, from the
+   site's own copy of Overture Maps places (loaded monthly by scripts/load_places.py).
 
-Both are free community services with usage policies, and most of this file is
-about staying inside them:
-
-* Postgres caches geocodes for 30 days and place lists for 24 hours, so a
-  repeated search makes no upstream call at all.
-* Nominatim calls start at least one second apart across every running
-  instance, through a reservation kept in the database.
-* Each visitor (a salted hash of the IP address) gets a daily allowance of
-  searches that need live data, and the whole site gets a daily allowance of
-  upstream calls. When the database cannot be reached the search is refused,
-  never run without those checks.
-* After a 429 or 504 from the main Overpass instance the query is retried once
-  on a documented public mirror, and the instance that refused is left alone
-  for 30 seconds, as the Overpass wiki asks.
-* Search text reaches an Overpass query only through regex_literal() and
-  ql_string(), so it can never leave its string or its regular expression.
+Searches are cheap database reads, so they get a generous daily allowance. Calls to GeoSearch
+get a smaller one. Both are counted per visitor (a salted hash of the IP address) and for the
+whole site, in Postgres; when the database cannot be reached the search is refused.
 
 Responses are JSON. Success is {"ok": true, ...}; every failure is
 {"ok": false, "error": {"code": ..., "message": ...}} with a code from ERRORS.
@@ -48,14 +40,15 @@ from urllib.parse import urlencode, urlsplit
 
 # ------------------------------------------------------------------ settings
 
-DEFAULT_USER_AGENT = "place-finder-demo/1.0 (portfolio project)"
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-# Public instances are listed at
-# https://wiki.openstreetmap.org/wiki/Overpass_API#Public_Overpass_API_instances (read 2026-11-09).
-# The main instance is run by FOSSGIS. The mirror is the private.coffee instance ("previously known
-# as overpass.kumi.systems"), which that table says may be used in any project, with no rate limit.
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
-OVERPASS_MIRROR_URL = "https://overpass.private.coffee/api/interpreter"
+USER_AGENT = "place-finder-demo/1.0 (portfolio project)"
+# NYC GeoSearch: Pelias over the City's Property Address Directory. No key; the documentation
+# (https://geosearch.planninglabs.nyc/docs, source at github.com/NYCPlanning/labs-geosearch-docs,
+# read 2026-11-09) publishes no rate limit, and asks only that autocomplete be throttled. This
+# site never autocompletes: it geocodes once per submitted search, and caches the answer.
+GEOSEARCH_URL = "https://geosearch.planninglabs.nyc/v2/search"
+# GeoSearch scores how well a result matches the parsed input text, from 0 to 1. Below this the
+# match is treated as not found rather than shown as a guess.
+MIN_GEOCODE_CONFIDENCE = 0.8
 
 MAX_BODY_BYTES = 2048
 MAX_WHAT = 40
@@ -64,30 +57,20 @@ MIN_TEXT = 2
 RADII = (500, 1000, 1500, 2500)
 DEFAULT_RADIUS = 1500
 MAX_PLACES = 60
-OVERPASS_ELEMENT_LIMIT = 200
-OVERPASS_TIMEOUT_S = 10  # sent to Overpass as [timeout:10]
-OVERPASS_HTTP_TIMEOUT_S = 12
-NOMINATIM_HTTP_TIMEOUT_S = 6
-NOMINATIM_MAX_WAIT_MS = 3000
-OVERPASS_MAX_WAIT_MS = 2000
-# The Overpass wiki asks clients to wait 30 seconds after a 429 before the next request.
-PAUSE_AFTER_REFUSAL_S = 30
-REQUEST_BUDGET_S = 25  # under the 30 second maxDuration set in vercel.json
-MIN_ATTEMPT_S = 4
-MAX_UPSTREAM_BYTES = 2_000_000
+GEOSEARCH_TIMEOUT_S = 6
+MAX_UPSTREAM_BYTES = 1_000_000
 CONNECT_TIMEOUT_S = 8
-# Statuses that mean "busy, ask someone else": these send the query to the mirror.
-RETRYABLE = frozenset({429, 502, 503, 504})
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
-# Defaults for the daily limits, overridable with environment variables. The Overpass wiki puts
-# a regularly used website at under about 100 queries and 10 MB a day on the main instance, summed
-# over all of its users, so the site-wide cap on upstream calls defaults to 100.
-VISITOR_DAILY_DEFAULT = 10
-UPSTREAM_DAILY_DEFAULT = 100
+# Daily allowances, overridable with environment variables. A search is one indexed query, so a
+# person browsing never meets the search limit; the geocoder limits keep this site a light user
+# of a free City service.
+SEARCHES_PER_VISITOR = 300
+SEARCHES_PER_DAY = 20_000
+GEOCODES_PER_VISITOR = 30
+GEOCODES_PER_DAY = 1_000
 
-# Indirection points for the tests, which swap in a fake clock.
-sleep = time.sleep
+# An indirection point for the tests, which swap in a fake clock.
 monotonic = time.monotonic
 
 
@@ -96,12 +79,11 @@ class Settings:
     db_url: str
     hash_salt: str
     allowed_origins: frozenset
-    user_agent: str
-    visitor_daily: int
-    upstream_daily: int
-    nominatim_url: str
-    overpass_url: str
-    overpass_mirror_url: str
+    searches_per_visitor: int
+    searches_per_day: int
+    geocodes_per_visitor: int
+    geocodes_per_day: int
+    geosearch_url: str
 
 
 def _env_int(env, name, default, low, high):
@@ -112,27 +94,17 @@ def _env_int(env, name, default, low, high):
     return min(max(value, low), high)
 
 
-def _user_agent(value):
-    """The configured User-Agent if it is plain printable ASCII, otherwise the default."""
-    value = (value or "").strip()
-    if not value or len(value) > 200 or not all(" " <= ch <= "~" for ch in value):
-        return DEFAULT_USER_AGENT
-    return value
-
-
 def load_settings(env=None):
     env = os.environ if env is None else env
     return Settings(
         db_url=env.get("PLACES_DB_URL", ""),
         hash_salt=env.get("PLACES_HASH_SALT", ""),
         allowed_origins=parse_origins(env.get("PLACES_ALLOWED_ORIGINS", "")),
-        user_agent=_user_agent(env.get("PLACES_USER_AGENT")),
-        visitor_daily=_env_int(env, "PLACES_VISITOR_DAILY", VISITOR_DAILY_DEFAULT, 0, 1000),
-        upstream_daily=_env_int(env, "PLACES_UPSTREAM_DAILY", UPSTREAM_DAILY_DEFAULT, 0, 10000),
-        # Nominatim's policy asks that an app can switch services without a code change.
-        nominatim_url=env.get("PLACES_NOMINATIM_URL") or NOMINATIM_URL,
-        overpass_url=env.get("PLACES_OVERPASS_URL") or OVERPASS_URL,
-        overpass_mirror_url=env.get("PLACES_OVERPASS_MIRROR_URL") or OVERPASS_MIRROR_URL,
+        searches_per_visitor=_env_int(env, "PLACES_SEARCHES_PER_VISITOR", SEARCHES_PER_VISITOR, 0, 100_000),
+        searches_per_day=_env_int(env, "PLACES_SEARCHES_PER_DAY", SEARCHES_PER_DAY, 0, 10_000_000),
+        geocodes_per_visitor=_env_int(env, "PLACES_GEOCODES_PER_VISITOR", GEOCODES_PER_VISITOR, 0, 10_000),
+        geocodes_per_day=_env_int(env, "PLACES_GEOCODES_PER_DAY", GEOCODES_PER_DAY, 0, 1_000_000),
+        geosearch_url=env.get("PLACES_GEOSEARCH_URL") or GEOSEARCH_URL,
     )
 
 
@@ -144,6 +116,7 @@ ERRORS = {
     "forbidden": 403,
     "not_found": 404,
     "method_not_allowed": 405,
+    "out_of_area": 422,
     "rate_limited": 429,
     "upstream_busy": 503,
     "unavailable": 503,
@@ -172,7 +145,8 @@ def invalid(message):
 def upstream_busy():
     return SearchFailure(
         "upstream_busy",
-        "The free OpenStreetMap service is busy right now. Please try again in a few seconds.",
+        "NYC's address lookup service didn't answer. Please try again in a few seconds, or move the map "
+        "and choose Search this area, which doesn't need it.",
         retry_after=10,
     )
 
@@ -185,32 +159,45 @@ def unavailable():
     )
 
 
+def out_of_area(typed=None):
+    where = f"“{typed}” is" if typed else "The map center is"
+    return SearchFailure(
+        "out_of_area",
+        f"{where} outside New York City. Place Finder covers the five boroughs only: Manhattan, Brooklyn, "
+        "Queens, the Bronx and Staten Island.",
+    )
+
+
 def seconds_until_utc_midnight(now=None):
     now = now or datetime.now(timezone.utc)
     tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     return max(int((tomorrow - now).total_seconds()), 1)
 
 
-def rate_limited(reason, per_visitor):
+def rate_limited(kind, verdict, per_visitor):
     wait = seconds_until_utc_midnight()
     hours = max(1, round(wait / 3600))
     when = "about an hour" if hours == 1 else f"about {hours} hours"
-    if reason == "visitor":
+    if kind == "search" and verdict == "visitor_limit":
+        message = f"You've run {per_visitor} searches today, the limit for one visitor. It resets in {when}."
+    elif kind == "search":
+        message = f"This demo has reached its daily search limit. It resets in {when}."
+    elif verdict == "visitor_limit":
         message = (
-            f"You've run {per_visitor} new searches today, the limit for one visitor on this demo. "
-            f"Searches that are already cached still work. New ones open up again in {when}."
+            f"You've looked up {per_visitor} new locations today, the limit for one visitor. Locations "
+            "already looked up still work, and so does moving the map and choosing Search this area."
         )
     else:
         message = (
-            "This demo has used today's share of the free OpenStreetMap services. "
-            f"Searches that are already cached still work. New ones open up again in {when}."
+            "This demo has used today's share of NYC's address lookup service. Locations already looked "
+            "up still work, and so does moving the map and choosing Search this area."
         )
     return SearchFailure("rate_limited", message, retry_after=wait)
 
 
 # ------------------------------------------------------------------ text
 
-_QUOTES = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'})
+_QUOTES = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"'})
 
 
 def _drop_controls(text):
@@ -241,58 +228,62 @@ def location_key(text):
     return ", ".join(part for part in parts if part)
 
 
-# ------------------------------------------------------------------ Overpass QL escaping
-
-# The characters POSIX extended regular expressions treat as special outside a bracket expression.
-# A backslash before each one makes it literal, in POSIX and in Python's re alike. "]" and "}" are
-# ordinary outside brackets and braces, and a backslash before them is undefined in POSIX, so they
-# are left alone.
-_ERE_SPECIAL = frozenset("\\.[()*+?{|^$")
-
-
-def regex_literal(text):
-    """A POSIX extended regular expression that matches exactly this text."""
-    return "".join("\\" + ch if ch in _ERE_SPECIAL else ch for ch in text)
+# Trailing words that only say "in New York", and the borough names a location may end with.
+_CITY_WORDS = ("new york city", "new york", "nyc", "ny", "usa", "us")
+_BOROUGH_SUFFIXES = (("staten island", 5), ("the bronx", 2), ("manhattan", 1), ("brooklyn", 3),
+                     ("queens", 4), ("bronx", 2))
+# Words that tell nothing about where in the city a place is, for the geocoder check below.
+_NOT_SPECIFIC = frozenset(w for phrase in _CITY_WORDS + tuple(n for n, _ in _BOROUGH_SUFFIXES)
+                          for w in phrase.split()) | {"the", "of", "and", "in"}
 
 
-def ql_string(value):
-    """A double-quoted Overpass QL string that decodes to exactly this value.
+def neighborhood_candidates(text):
+    """(alias, borough code or None) pairs to look up, most literal first.
 
-    Overpass decodes C-style escapes in strings (backslash and quote among them), so both are
-    escaped. Control characters are refused rather than escaped; request text has them removed
-    before it gets here, so meeting one means a bug, and a bug should not reach Overpass.
+    "Williamsburg, Brooklyn, NY" tries "williamsburg brooklyn", then "williamsburg" in Brooklyn.
     """
-    if any(unicodedata.category(ch).startswith("C") for ch in value):
-        raise ValueError("control character in an Overpass string")
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    words = fold(text)
+    stripped = True
+    while stripped:
+        stripped = False
+        for noise in _CITY_WORDS:
+            if words.endswith(" " + noise):
+                words, stripped = words[: -len(noise) - 1].strip(), True
+    yield words, None
+    for name, code in _BOROUGH_SUFFIXES:
+        if words.endswith(" " + name):
+            yield words[: -len(name) - 1].strip(), code
+            break
 
 
-def tag_is(key, value):
-    return f"[{ql_string(key)}={ql_string(value)}]"
+def geocode_matches_text(query, label):
+    """Whether a GeoSearch answer plausibly names what was typed.
+
+    GeoSearch is an address geocoder. Given a house number it is reliable; given only a name it
+    falls back to a fuzzy street match ("Greenwich Village" came back as 37 Greenwich Street).
+    So a query without digits is accepted only when every specific word in it starts a word of
+    the answer's label.
+    """
+    if any(ch.isdigit() for ch in query):
+        return True
+    wanted = [w for w in fold(query).split() if w not in _NOT_SPECIFIC]
+    have = fold(label or "").split()
+    return bool(wanted) and all(any(h.startswith(w) for h in have) for w in wanted)
 
 
-def tag_in(key, *values):
-    pattern = "^(" + "|".join(regex_literal(v) for v in values) + ")$"
-    return f"[{ql_string(key)}~{ql_string(pattern)}]"
+def like_escape(text):
+    """Text for a LIKE or ILIKE pattern with ESCAPE '\\': every character matches itself.
 
-
-def tag_lists(key, *words):
-    """The tag's semicolon-separated list holds one of these words, ignoring case."""
-    pattern = "(^|;) *(" + "|".join(regex_literal(w) for w in words) + ") *(;|$)"
-    return f"[{ql_string(key)}~{ql_string(pattern)},i]"
-
-
-def tag_contains(key, text):
-    """The tag's value contains this text, ignoring case."""
-    return f"[{ql_string(key)}~{ql_string(regex_literal(text))},i]"
-
-
-def keys_match(*keys):
-    """The element has a tag with one of these keys."""
-    return f"[~{ql_string('^(' + '|'.join(regex_literal(k) for k in keys) + ')$')}~{ql_string('.')}]"
+    The query itself is parameterized, so this is not about SQL injection. It stops a typed
+    % or _ from acting as a wildcard inside the pattern.
+    """
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 # ------------------------------------------------------------------ vocabulary
+#
+# Each entry maps everyday words to Overture category keys (taxonomy.primary). Every key was
+# checked against the loaded release 2026-10-21.0 with `load_places.py check-vocabulary`.
 
 
 @dataclass(frozen=True)
@@ -301,100 +292,110 @@ class Category:
     label: str
     group: str
     synonyms: tuple
-    clauses: tuple  # Overpass tag filters; a place matching any one clause is a match
+    keys: tuple  # Overture taxonomy.primary values that count as a match
 
 
-FOOD_PLACE = tag_in("amenity", "restaurant", "fast_food")
 FOOD, EVERYDAY, HEALTH = "Food and drink", "Everyday services", "Health"
 
-
-def _cuisine(*words):
-    return FOOD_PLACE + tag_lists("cuisine", *words)
-
+# Every key ending in _restaurant with at least 20 places in the release, plus "restaurant".
+RESTAURANT_KEYS = (
+    "afghani_restaurant", "african_restaurant", "american_restaurant", "argentine_restaurant",
+    "asian_fusion_restaurant", "asian_restaurant", "bangladeshi_restaurant", "bar_and_grill_restaurant",
+    "barbecue_restaurant", "brazilian_restaurant", "breakfast_and_brunch_restaurant", "buffet_restaurant",
+    "burger_restaurant", "cajun_and_creole_restaurant", "caribbean_restaurant", "chicken_restaurant",
+    "chicken_wings_restaurant", "chinese_restaurant", "colombian_restaurant", "comfort_food_restaurant",
+    "cuban_restaurant", "dim_sum_restaurant", "dominican_restaurant", "doner_kebab_restaurant",
+    "dumpling_restaurant", "eastern_european_restaurant", "ecuadorian_restaurant", "ethiopian_restaurant",
+    "european_restaurant", "falafel_restaurant", "fast_food_restaurant", "filipino_restaurant",
+    "fish_and_chips_restaurant", "french_restaurant", "georgian_restaurant", "german_restaurant",
+    "greek_restaurant", "guatemalan_restaurant", "haitian_restaurant", "halal_restaurant",
+    "hawaiian_restaurant", "health_food_restaurant", "hot_dog_restaurant", "indian_restaurant",
+    "italian_restaurant", "jamaican_restaurant", "japanese_restaurant", "korean_restaurant",
+    "kosher_restaurant", "latin_american_restaurant", "lebanese_restaurant", "malaysian_restaurant",
+    "mediterranean_restaurant", "mexican_restaurant", "middle_eastern_restaurant", "nepalese_restaurant",
+    "pakistani_restaurant", "pan_asian_restaurant", "peruvian_restaurant", "pizza_restaurant",
+    "poke_restaurant", "puerto_rican_restaurant", "ramen_restaurant", "restaurant", "russian_restaurant",
+    "salvadoran_restaurant", "seafood_restaurant", "soup_restaurant", "southern_american_restaurant",
+    "spanish_restaurant", "sushi_restaurant", "taco_restaurant", "taiwanese_restaurant", "texmex_restaurant",
+    "thai_restaurant", "turkish_restaurant", "uzbek_restaurant", "vegan_restaurant", "vegetarian_restaurant",
+    "venezuelan_restaurant", "vietnamese_restaurant",
+)
 
 VOCABULARY = (
     Category("coffee", "Coffee", FOOD, ("cafe", "coffee shop", "espresso", "latte"),
-             (tag_is("amenity", "cafe"), tag_is("shop", "coffee"))),
+             ("coffee_shop", "cafe", "coffee_roastery")),
     Category("pizza", "Pizza", FOOD, ("pizzeria", "pizza place", "slice"),
-             (_cuisine("pizza"), FOOD_PLACE + tag_contains("name", "pizz"))),
-    Category("bakery", "Bakery", FOOD, ("bread", "pastry", "pastries", "bake shop"),
-             (tag_is("shop", "bakery"), tag_is("shop", "pastry"))),
+             ("pizza_restaurant", "pizza_delivery_service")),
+    Category("bakery", "Bakery", FOOD, ("bread", "pastry", "pastries", "bake shop"), ("bakery",)),
     Category("bar", "Bar", FOOD, ("pub", "drinks", "cocktails", "beer", "brewery", "tavern"),
-             (tag_in("amenity", "bar", "pub", "biergarten"),)),
-    Category("restaurant", "Restaurant", FOOD, ("food", "dinner", "lunch", "eat", "dining"),
-             (tag_is("amenity", "restaurant"),)),
+             ("bar", "cocktail_bar", "pub", "sports_bar", "wine_bar", "dive_bar", "gastropub", "irish_pub",
+              "beer_bar", "beer_garden", "gay_bar", "brewery", "whiskey_bar")),
+    Category("restaurant", "Restaurant", FOOD, ("food", "dinner", "lunch", "eat", "dining"), RESTAURANT_KEYS),
     Category("fast food", "Fast food", FOOD, ("fastfood", "takeout", "take out", "quick bite"),
-             (tag_is("amenity", "fast_food"),)),
+             ("fast_food_restaurant", "hot_dog_restaurant")),
     Category("ice cream", "Ice cream", FOOD, ("gelato", "frozen yogurt", "dessert"),
-             (tag_is("amenity", "ice_cream"), tag_is("shop", "ice_cream"))),
-    Category("burger", "Burgers", FOOD, ("hamburger", "cheeseburger"),
-             (_cuisine("burger"),)),
-    Category("sushi", "Sushi", FOOD, ("japanese", "ramen"),
-             (_cuisine("sushi", "japanese", "ramen"),)),
+             ("ice_cream_shop", "gelato_shop", "frozen_yogurt_shop", "dessert_shop")),
+    Category("burger", "Burgers", FOOD, ("hamburger", "cheeseburger"), ("burger_restaurant",)),
+    Category("sushi", "Sushi and Japanese", FOOD, ("japanese", "ramen"),
+             ("sushi_restaurant", "japanese_restaurant", "ramen_restaurant")),
     Category("mexican", "Mexican", FOOD, ("taco", "tacos", "burrito", "taqueria"),
-             (_cuisine("mexican", "tex-mex", "taco", "tacos", "burrito"),)),
+             ("mexican_restaurant", "taco_restaurant", "texmex_restaurant")),
     Category("chinese", "Chinese", FOOD, ("dim sum", "dumplings"),
-             (_cuisine("chinese", "dim_sum", "dumpling", "cantonese", "sichuan"),)),
+             ("chinese_restaurant", "dim_sum_restaurant", "dumpling_restaurant", "cantonese_restaurant",
+              "sichuan_restaurant", "shanghainese_restaurant")),
     Category("deli", "Deli", FOOD, ("sandwich", "sandwiches", "bagel", "bagels"),
-             (tag_is("shop", "deli"), _cuisine("sandwich", "deli", "bagel"))),
+             ("delicatessen", "sandwich_shop", "bagel_shop")),
     Category("liquor store", "Liquor store", FOOD, ("liquor", "wine", "wine shop", "beer store"),
-             (tag_in("shop", "alcohol", "wine", "beverages"),)),
+             ("liquor_store", "beer_wine_spirits_store")),
 
-    Category("grocery", "Grocery", EVERYDAY, ("groceries", "grocery store", "grocer", "food market"),
-             (tag_in("shop", "supermarket", "grocery", "greengrocer"),)),
-    Category("supermarket", "Supermarket", EVERYDAY, ("super market",),
-             (tag_is("shop", "supermarket"),)),
+    Category("grocery", "Grocery", EVERYDAY,
+             ("groceries", "grocery store", "grocer", "food market", "supermarket", "super market"),
+             ("grocery_store", "asian_grocery_store", "organic_grocery_store", "international_grocery_store",
+              "mexican_grocery_store", "kosher_grocery_store", "health_market")),
     Category("convenience store", "Convenience store", EVERYDAY, ("convenience", "bodega", "corner store"),
-             (tag_is("shop", "convenience"),)),
+             ("convenience_store",)),
     Category("laundry", "Laundry", EVERYDAY, ("laundromat", "dry cleaner", "dry cleaning", "laundry service"),
-             (tag_in("shop", "laundry", "dry_cleaning"),)),
-    Category("bank", "Bank", EVERYDAY, ("credit union",),
-             (tag_is("amenity", "bank"),)),
-    Category("atm", "ATM (cash machine)", EVERYDAY, ("cash machine", "cash"),
-             (tag_is("amenity", "atm"), tag_is("amenity", "bank") + tag_is("atm", "yes"))),
-    Category("library", "Library", EVERYDAY, ("public library",),
-             (tag_is("amenity", "library"),)),
-    Category("park", "Park", EVERYDAY, ("green space", "garden"),
-             (tag_is("leisure", "park"),)),
-    Category("playground", "Playground", EVERYDAY, ("play area",),
-             (tag_is("leisure", "playground"),)),
+             ("laundromat", "dry_cleaning", "laundry_service")),
+    Category("bank", "Bank", EVERYDAY, ("credit union",), ("bank", "bank_or_credit_union", "credit_union")),
+    Category("atm", "ATM (cash machine)", EVERYDAY, ("cash machine", "cash"), ("atm",)),
+    Category("library", "Library", EVERYDAY, ("public library",), ("library",)),
+    Category("park", "Park", EVERYDAY, ("green space", "dog park"), ("park", "dog_park", "state_park", "national_park")),
+    Category("playground", "Playground", EVERYDAY, ("play area",), ("playground",)),
     Category("gym", "Gym", EVERYDAY, ("fitness", "fitness center", "workout"),
-             (tag_is("leisure", "fitness_centre"),)),
-    Category("post office", "Post office", EVERYDAY, ("post", "mail"),
-             (tag_is("amenity", "post_office"),)),
-    Category("gas station", "Gas station", EVERYDAY, ("gas", "petrol", "fuel"),
-             (tag_is("amenity", "fuel"),)),
+             ("gym", "sport_or_fitness_facility", "boxing_gym")),
+    Category("post office", "Post office", EVERYDAY, ("post", "mail"), ("post_office",)),
+    Category("gas station", "Gas station", EVERYDAY, ("gas", "petrol", "fuel"), ("gas_station", "fueling_station")),
     Category("hardware store", "Hardware store", EVERYDAY, ("hardware", "home improvement"),
-             (tag_in("shop", "hardware", "doityourself"),)),
+             ("hardware_store", "home_improvement_store", "hardware_home_and_garden_store")),
     Category("bookstore", "Bookstore", EVERYDAY, ("books", "bookshop", "book store"),
-             (tag_is("shop", "books"),)),
-    Category("hair salon", "Hair salon", EVERYDAY, ("barber", "barbershop", "salon", "haircut"),
-             (tag_is("shop", "hairdresser"),)),
+             ("bookstore", "used_bookstore", "academic_bookstore")),
+    Category("hair salon", "Hair salon or barber", EVERYDAY, ("barber", "barbershop", "salon", "haircut"),
+             ("hair_salon", "barber", "hair_stylist", "kids_hair_salon")),
     Category("bike shop", "Bike shop", EVERYDAY, ("bike", "bicycle", "bicycle shop", "bike repair"),
-             (tag_is("shop", "bicycle"),)),
-    Category("hotel", "Hotel", EVERYDAY, ("motel", "hostel", "lodging", "guest house"),
-             (tag_in("tourism", "hotel", "motel", "hostel", "guest_house"),)),
-    Category("museum", "Museum", EVERYDAY, ("gallery", "art museum"),
-             (tag_is("tourism", "museum"),)),
-    Category("pet store", "Pet store", EVERYDAY, ("pet shop", "pet supplies", "pets"),
-             (tag_is("shop", "pet"),)),
+             ("bike_store", "bike_repair_maintenance")),
+    Category("hotel", "Hotel", EVERYDAY, ("motel", "hostel", "lodging"), ("hotel", "motel", "hostel")),
+    Category("museum", "Museum", EVERYDAY, ("art museum", "history museum"),
+             ("museum", "art_museum", "history_museum", "childrens_museum", "science_museum",
+              "contemporary_art_museum", "modern_art_museum", "design_museum", "community_museum")),
+    Category("art gallery", "Art gallery", EVERYDAY, ("gallery", "galleries"), ("art_gallery",)),
+    Category("pet store", "Pet store", EVERYDAY, ("pet shop", "pet supplies", "pets", "pet"),
+             ("pet_store", "aquatic_pet_store")),
     Category("movie theater", "Movie theater", EVERYDAY, ("cinema", "movies", "movie theatre"),
-             (tag_is("amenity", "cinema"),)),
+             ("movie_theater", "drive_in_theater")),
 
-    Category("pharmacy", "Pharmacy", HEALTH, ("drugstore", "drug store", "chemist"),
-             (tag_is("amenity", "pharmacy"), tag_is("healthcare", "pharmacy"))),
+    Category("pharmacy", "Pharmacy", HEALTH, ("drugstore", "drug store", "chemist"), ("pharmacy", "drugstore")),
     Category("clinic", "Clinic", HEALTH, ("urgent care", "walk in clinic", "health center", "medical center"),
-             (tag_is("amenity", "clinic"), tag_is("healthcare", "clinic"))),
+             ("urgent_care_clinic", "walk_in_clinic", "public_health_clinic", "primary_care_or_general_clinic",
+              "pediatric_clinic")),
     Category("hospital", "Hospital", HEALTH, ("emergency room", "emergency"),
-             (tag_is("amenity", "hospital"), tag_is("healthcare", "hospital"))),
+             ("hospital", "emergency_department", "childrens_hospital")),
     Category("dentist", "Dentist", HEALTH, ("dental", "dental office", "orthodontist"),
-             (tag_is("amenity", "dentist"), tag_is("healthcare", "dentist"))),
-    Category("doctor", "Doctor", HEALTH, ("physician", "primary care", "medical office"),
-             (tag_is("amenity", "doctors"), tag_is("healthcare", "doctor"))),
+             ("dental_clinic", "general_dentistry", "cosmetic_dentistry", "pediatric_dentistry")),
+    Category("doctor", "Doctor", HEALTH, ("physician", "primary care", "medical office"), ("doctors_office",)),
     Category("eye care", "Eye care", HEALTH, ("optician", "optometrist", "eye doctor", "glasses", "eyeglasses"),
-             (tag_is("shop", "optician"), tag_is("healthcare", "optometrist"))),
+             ("optometry", "vision_or_eye_care_clinic", "eyewear_store")),
     Category("veterinarian", "Veterinarian", HEALTH, ("vet", "animal hospital", "veterinary"),
-             (tag_is("amenity", "veterinary"),)),
+             ("veterinarian", "animal_hospital", "emergency_pet_hospital", "veterinary_care")),
 )
 
 
@@ -420,10 +421,6 @@ class Term:
     key: str  # the vocabulary key, or the typed text in lower case
     label: str
 
-    @property
-    def cache_key(self):
-        return ("c:" if self.kind == "category" else "n:") + self.key
-
 
 def _singulars(folded):
     if folded.endswith("ies") and len(folded) > 4:
@@ -435,7 +432,7 @@ def _singulars(folded):
 
 
 def resolve_term(text):
-    """A vocabulary category when the text names one, otherwise a case-insensitive name match."""
+    """A vocabulary category when the text names one, otherwise a name match."""
     folded = fold(text)
     for candidate in (folded, *_singulars(folded)):
         category = TERM_INDEX.get(candidate)
@@ -512,28 +509,56 @@ def parse_request(data):
         )
     where = _text_field(
         data, "where", MAX_WHERE,
-        "Add a location, like a neighborhood, city or postal code.",
+        "Add a neighborhood or address in New York City.",
         f"Keep the location to {MAX_WHERE} characters.",
     )
     return SearchRequest(what=what, term=term, radius=radius, where=location_key(where), where_text=where)
 
 
-# ------------------------------------------------------------------ the Overpass query
+# ------------------------------------------------------------------ the place query
+#
+# One parameterized query per search. The two variants differ only in their match clause, and
+# both clauses are constants: no request text is ever formatted into SQL.
 
-NAMED = keys_match("name", "brand", "operator")
-POI_KEYS = ("amenity", "shop", "healthcare", "leisure", "tourism", "craft", "office", "club")
-IS_POI = keys_match(*POI_KEYS)
+_SEARCH_SQL = """
+with here as (select st_setsrid(st_makepoint(%(lng)s, %(lat)s), 4326)::geography as pt)
+select p.id::text, p.name, p.category, p.street, p.locality, p.postcode, p.phone, p.website, p.borough,
+       st_y(p.geog::geometry), st_x(p.geog::geometry), st_distance(p.geog, here.pt)
+from places.places p, here
+where st_dwithin(p.geog, here.pt, %(radius)s)
+  and ({match})
+order by p.geog <-> here.pt
+limit %(limit)s
+"""
+CATEGORY_SQL = _SEARCH_SQL.format(match="p.category = any(%(categories)s)")
+# A name containing the typed text (trigram-indexed ILIKE), a close spelling for longer terms
+# (pg_trgm's <% word similarity, default threshold 0.6), or a category key with the typed word
+# in it, so "thai" finds thai_restaurant even when the name does not say so.
+NAME_SQL = _SEARCH_SQL.format(match=(
+    "p.name ilike %(contains)s escape '\\'"
+    " or (%(fuzzy)s and %(text)s <%% p.name)"
+    " or p.category = %(slug)s"
+    " or p.category like %(slug_start)s escape '\\'"
+    " or p.category like %(slug_end)s escape '\\'"
+    " or p.category like %(slug_middle)s escape '\\'"
+))
 
 
-def build_query(term, lat, lng, radius):
-    """The Overpass QL query for a term around a point. Every string in it comes from ql_string()."""
-    around = f"(around:{int(radius)},{lat:.3f},{lng:.3f})"
+def search_params(term, lat, lng, radius, limit):
+    params = {"lat": lat, "lng": lng, "radius": radius, "limit": limit}
     if term.kind == "category":
-        clauses = [clause + NAMED for clause in CATEGORIES[term.key].clauses]
-    else:
-        clauses = [IS_POI + tag_contains("name", term.key), IS_POI + tag_contains("cuisine", term.key)]
-    body = "".join(f"nwr{clause}{around};" for clause in clauses)
-    return f"[out:json][timeout:{OVERPASS_TIMEOUT_S}];({body});out center {OVERPASS_ELEMENT_LIMIT};"
+        return CATEGORY_SQL, {**params, "categories": list(CATEGORIES[term.key].keys)}
+    slug = like_escape(fold(term.key).replace(" ", "_"))
+    return NAME_SQL, {
+        **params,
+        "contains": f"%{like_escape(term.key)}%",
+        "fuzzy": len(term.key) >= 4,
+        "text": term.key,
+        "slug": fold(term.key).replace(" ", "_"),  # empty never matches: categories are non-empty
+        "slug_start": f"{slug}\\_%",
+        "slug_end": f"%\\_{slug}",
+        "slug_middle": f"%\\_{slug}\\_%",
+    }
 
 
 # ------------------------------------------------------------------ upstream HTTP
@@ -556,13 +581,10 @@ def _gunzip(raw, limit=MAX_UPSTREAM_BYTES):
     return out
 
 
-def http_request(url, *, user_agent, timeout, form=None):
-    """One request to an upstream service. Network trouble comes back as Reply(None), never raises."""
-    data = urlencode(form).encode("utf-8") if form is not None else None
-    headers = {"User-Agent": user_agent, "Accept": "application/json", "Accept-Encoding": "gzip"}
-    if data is not None:
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-    request = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
+def http_request(url, *, timeout):
+    """One GET to the geocoder. Network trouble comes back as Reply(None), never raises."""
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json", "Accept-Encoding": "gzip"}
+    request = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read(MAX_UPSTREAM_BYTES + 1)
@@ -582,47 +604,7 @@ def http_request(url, *, user_agent, timeout, form=None):
     return Reply(status, raw)
 
 
-def call_upstream(name, url, settings, timeout, form=None):
-    started = monotonic()
-    reply = http_request(url, user_agent=settings.user_agent, timeout=timeout, form=form)
-    # One line per upstream call, with no search text and no visitor details.
-    print(f"upstream {name}: {reply.status or 'no reply'} in {round((monotonic() - started) * 1000)} ms, "
-          f"{len(reply.body)} bytes")
-    return reply
-
-
-class Deadline:
-    def __init__(self, seconds):
-        self.end = monotonic() + seconds
-
-    def left(self):
-        return self.end - monotonic()
-
-
 # ------------------------------------------------------------------ limits
-
-
-class LiveBudget:
-    """Counts one search's upstream calls against the daily limits, visitor first."""
-
-    def __init__(self, store, visitor, settings):
-        self.store = store
-        self.visitor = visitor
-        self.settings = settings
-        self.started = False
-
-    def take(self):
-        if not self.started:
-            verdict = self.store.begin_live_search(
-                self.visitor, self.settings.visitor_daily, self.settings.upstream_daily
-            )
-            if verdict == "visitor_limit":
-                raise rate_limited("visitor", self.settings.visitor_daily)
-            if verdict != "ok":
-                raise rate_limited("global", self.settings.visitor_daily)
-            self.started = True
-        elif not self.store.take_upstream_slot(self.settings.upstream_daily):
-            raise rate_limited("global", self.settings.visitor_daily)
 
 
 def quota_key(ip):
@@ -643,6 +625,16 @@ def visitor_key(ip, salt):
     return hmac.new(salt.encode("utf-8"), quota_key(ip).encode("utf-8"), hashlib.sha256).hexdigest()[:32]
 
 
+def take(store, kind, visitor, settings):
+    if kind == "search":
+        per_visitor, per_day = settings.searches_per_visitor, settings.searches_per_day
+    else:
+        per_visitor, per_day = settings.geocodes_per_visitor, settings.geocodes_per_day
+    verdict = store.take_slot(kind, visitor, per_visitor, per_day)
+    if verdict != "ok":
+        raise rate_limited(kind, verdict, per_visitor)
+
+
 # ------------------------------------------------------------------ geocoding
 
 
@@ -654,154 +646,72 @@ class Geocode:
     label: str | None = None
 
 
-def _short_label(display_name):
-    parts = [part.strip() for part in clean_text(display_name).split(",") if part.strip()]
-    return ", ".join(parts[:3])[:200]
+def parse_geosearch(body):
+    """The best GeoSearch match as a Geocode, or None when the answer is not the expected shape.
 
-
-def parse_geocode(body):
-    """Nominatim's jsonv2 answer as a Geocode, or None when it is not the expected shape."""
+    GeoSearch answers in GeoJSON (it is Pelias): features[].geometry.coordinates is [lng, lat],
+    and properties carry a display label and a match confidence.
+    """
     try:
         data = json.loads(body)
     except ValueError:
         return None
-    if not isinstance(data, list):
+    features = data.get("features") if isinstance(data, dict) else None
+    if not isinstance(features, list):
         return None
-    if not data:
+    if not features:
         return Geocode(found=False)
-    first = data[0]
-    if not isinstance(first, dict):
-        return None
+    first = features[0] if isinstance(features[0], dict) else {}
+    properties = first.get("properties") if isinstance(first.get("properties"), dict) else {}
+    coordinates = (first.get("geometry") or {}).get("coordinates") if isinstance(first.get("geometry"), dict) else None
     try:
-        lat, lng = float(first["lat"]), float(first["lon"])
-    except (KeyError, TypeError, ValueError):
+        lng, lat = float(coordinates[0]), float(coordinates[1])
+        confidence = float(properties.get("confidence", 0))
+    except (TypeError, ValueError, IndexError):
         return None
     if not (math.isfinite(lat) and math.isfinite(lng) and -90 <= lat <= 90 and -180 <= lng <= 180):
         return None
-    label = first.get("display_name")
-    return Geocode(found=True, lat=lat, lng=lng, label=_short_label(label) if isinstance(label, str) else None)
+    if not math.isfinite(confidence) or confidence < MIN_GEOCODE_CONFIDENCE:
+        return Geocode(found=False)
+    label = properties.get("label")
+    label = clean_text(label)[:200] if isinstance(label, str) else None
+    return Geocode(found=True, lat=lat, lng=lng, label=label or None)
 
 
-def geocode_live(store, budget, query, settings, deadline):
-    if deadline.left() < MIN_ATTEMPT_S:
-        raise upstream_busy()
-    # The reservation keeps Nominatim calls at least a second apart across every instance.
-    wait_ms = store.reserve_call("nominatim", NOMINATIM_MAX_WAIT_MS)
-    if wait_ms is None:
-        raise upstream_busy()
-    budget.take()
-    if wait_ms > 0:
-        sleep(wait_ms / 1000)
-    params = {"q": query, "format": "jsonv2", "limit": 1, "accept-language": "en"}
-    reply = call_upstream("nominatim", f"{settings.nominatim_url}?{urlencode(params)}", settings,
-                          timeout=min(NOMINATIM_HTTP_TIMEOUT_S, max(deadline.left() - 1, 1)))
+def geocode_live(query, settings):
+    """GeoSearch's best match, or Geocode(found=False) when it does not plausibly match the text."""
+    params = {"text": query, "size": 1}
+    started = monotonic()
+    reply = http_request(f"{settings.geosearch_url}?{urlencode(params)}", timeout=GEOSEARCH_TIMEOUT_S)
+    # One line per geocoder call, with no search text and no visitor details.
+    print(f"upstream geosearch: {reply.status or 'no reply'} in {round((monotonic() - started) * 1000)} ms, "
+          f"{len(reply.body)} bytes")
     if reply.status != 200:
-        store.pause_upstream("nominatim", PAUSE_AFTER_REFUSAL_S)
         raise upstream_busy()
-    geo = parse_geocode(reply.body)
+    geo = parse_geosearch(reply.body)
     if geo is None:
         raise upstream_busy()
+    if geo.found and not geocode_matches_text(query, geo.label):
+        return Geocode(found=False)
     return geo
 
 
 # ------------------------------------------------------------------ places
 
-_RETRY, _FAIL = "retry", "fail"
-
-
-def read_overpass(reply):
-    """The element list, or _RETRY when the instance was busy, or _FAIL when retrying cannot help."""
-    if reply.status is None or reply.status in RETRYABLE:
-        return _RETRY
-    if reply.status != 200:
-        return _FAIL
-    try:
-        data = json.loads(reply.body)
-    except ValueError:
-        return _RETRY  # an overloaded server can answer 200 with an error page
-    if not isinstance(data, dict) or not isinstance(data.get("elements"), list):
-        return _RETRY
-    remark = data.get("remark")
-    # A query that ran out of time or memory still answers 200, with a remark and partial results.
-    if isinstance(remark, str) and "runtime error" in remark.lower():
-        return _RETRY
-    return data["elements"]
-
-
-def fetch_elements(store, budget, query, settings, deadline):
-    """Main instance first, then the mirror once. An instance that refused is skipped for 30 seconds."""
-    for name, url in (("overpass", settings.overpass_url), ("overpass-mirror", settings.overpass_mirror_url)):
-        if deadline.left() < MIN_ATTEMPT_S:
-            break
-        wait_ms = store.reserve_call(name, OVERPASS_MAX_WAIT_MS)
-        if wait_ms is None:
-            continue  # paused after a refusal, or already busy with other searches
-        budget.take()
-        if wait_ms > 0:
-            sleep(wait_ms / 1000)
-        reply = call_upstream(name, url, settings, form={"data": query},
-                              timeout=min(OVERPASS_HTTP_TIMEOUT_S, max(deadline.left() - 1, 1)))
-        outcome = read_overpass(reply)
-        if isinstance(outcome, list):
-            return outcome
-        store.pause_upstream(name, PAUSE_AFTER_REFUSAL_S)
-        if outcome == _FAIL:
-            break
-    raise upstream_busy()
-
-
-TAG_LABELS = {
-    ("amenity", "cafe"): "Cafe", ("shop", "coffee"): "Coffee shop", ("amenity", "fast_food"): "Fast food",
-    ("amenity", "ice_cream"): "Ice cream", ("shop", "ice_cream"): "Ice cream",
-    ("amenity", "biergarten"): "Beer garden", ("shop", "pastry"): "Pastry shop",
-    ("shop", "alcohol"): "Liquor store", ("shop", "wine"): "Wine shop", ("shop", "beverages"): "Drinks shop",
-    ("shop", "convenience"): "Convenience store", ("shop", "greengrocer"): "Greengrocer",
-    ("shop", "dry_cleaning"): "Dry cleaner", ("amenity", "atm"): "ATM (cash machine)",
-    ("leisure", "fitness_centre"): "Gym", ("amenity", "post_office"): "Post office",
-    ("amenity", "fuel"): "Gas station", ("shop", "doityourself"): "Home improvement",
-    ("shop", "books"): "Bookstore", ("shop", "hairdresser"): "Hair salon", ("shop", "bicycle"): "Bike shop",
-    ("tourism", "guest_house"): "Guest house", ("shop", "pet"): "Pet store",
-    ("amenity", "cinema"): "Movie theater", ("amenity", "doctors"): "Doctor",
-    ("healthcare", "optometrist"): "Optometrist", ("amenity", "veterinary"): "Veterinarian",
+CATEGORY_LABELS = {
+    "atm": "ATM (cash machine)", "bank_or_credit_union": "Bank", "doctors_office": "Doctor's office",
+    "optometry": "Optometrist", "delicatessen": "Deli", "drugstore": "Drugstore", "gym": "Gym",
+    "bike_store": "Bike shop", "dental_clinic": "Dentist", "general_dentistry": "Dentist",
+    "sport_or_fitness_facility": "Fitness center", "texmex_restaurant": "Tex-Mex restaurant",
 }
-CUISINE_PLACES = frozenset({"restaurant", "fast_food", "cafe"})
 PHONE_SHAPE = re.compile(r"\+?[0-9][0-9 ().\-/]{5,30}")
 _URL_BREAKERS = frozenset('"<>\\^`{|}')
 
 
-def _tag(tags, key, limit=200):
-    value = tags.get(key)
-    return clean_text(value)[:limit] if isinstance(value, str) else ""
-
-
-def _pretty(value):
-    return value.replace("_", " ").replace(";", " / ").strip().capitalize()
-
-
-def category_label(tags):
-    for key in POI_KEYS:
-        value = _tag(tags, key, 60)
-        if value:
-            label = TAG_LABELS.get((key, value)) or _pretty(value)
-            cuisine = _tag(tags, "cuisine", 60).split(";")[0].strip()
-            if key == "amenity" and value in CUISINE_PLACES and cuisine:
-                label = f"{label} · {_pretty(cuisine).lower()}"
-            return label[:60]
-    return "Place"
-
-
-def address_of(tags):
-    full = _tag(tags, "addr:full", 160)
-    if full:
-        return full
-    street = " ".join(p for p in (_tag(tags, "addr:housenumber", 20), _tag(tags, "addr:street", 80)) if p)
-    region = " ".join(p for p in (_tag(tags, "addr:state", 30), _tag(tags, "addr:postcode", 20)) if p)
-    return ", ".join(p for p in (street, _tag(tags, "addr:city", 60), region) if p)[:160]
-
-
-def phone_of(tags):
-    first = (_tag(tags, "phone") or _tag(tags, "contact:phone")).split(";")[0].strip()
-    return first if PHONE_SHAPE.fullmatch(first) else ""
+def category_label(key):
+    if not isinstance(key, str) or not key:
+        return "Place"
+    return CATEGORY_LABELS.get(key) or key.replace("_", " ").strip().capitalize()
 
 
 def https_url(value):
@@ -818,73 +728,31 @@ def https_url(value):
         return ""
     if parts.scheme.lower() != "https" or not parts.hostname or "@" in parts.netloc:
         return ""
-    return value
+    return "https" + value[len(parts.scheme):]  # schemes are case-insensitive; store one form
 
 
-def distance_m(lat1, lng1, lat2, lng2):
-    """Great-circle distance in meters."""
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp, dl = p2 - p1, math.radians(lng2 - lng1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * 6_371_000 * math.asin(min(1.0, math.sqrt(a)))
-
-
-def place_from(element, lat, lng, need_poi_tag):
-    if not isinstance(element, dict) or not isinstance(element.get("tags"), dict):
-        return None
-    kind, osm_id, tags = element.get("type"), element.get("id"), element["tags"]
-    if kind not in ("node", "way", "relation") or type(osm_id) is not int or osm_id <= 0:
-        return None
-    point = element if kind == "node" else element.get("center")
-    if not isinstance(point, dict):
-        return None
-    try:
-        plat, plng = float(point["lat"]), float(point["lon"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    if not (math.isfinite(plat) and math.isfinite(plng) and -90 <= plat <= 90 and -180 <= plng <= 180):
-        return None
-    name = _tag(tags, "name", 100) or _tag(tags, "brand", 100) or _tag(tags, "operator", 100)
-    if not name or (need_poi_tag and not any(_tag(tags, key) for key in POI_KEYS)):
-        return None
+def place_from_row(row):
+    gers, name, category, street, locality, postcode, phone, website, borough, lat, lng, distance = row
+    area = " ".join(p for p in (locality, postcode) if p)
     return {
-        "id": f"{kind}/{osm_id}",
+        "id": gers,
         "name": name,
-        "category": category_label(tags),
-        "address": address_of(tags),
-        "phone": phone_of(tags),
-        "hours": _tag(tags, "opening_hours", 160),
-        "website": https_url(tags.get("website") or tags.get("contact:website") or tags.get("url")),
-        "lat": round(plat, 6),
-        "lng": round(plng, 6),
-        "osm_url": f"https://www.openstreetmap.org/{kind}/{osm_id}",
-        "distance_m": round(distance_m(lat, lng, plat, plng)),
+        "category": category_label(category),
+        "address": ", ".join(p for p in (street, area) if p),
+        "phone": phone or "",
+        "website": https_url(website),
+        "borough": borough or "",
+        "lat": round(float(lat), 6),
+        "lng": round(float(lng), 6),
+        "distance_m": round(float(distance)),
     }
-
-
-def normalize_places(elements, term, lat, lng):
-    """(the closest places, up to MAX_PLACES; whether there were more matches than shown)."""
-    places, seen = [], set()
-    for element in elements:
-        place = place_from(element, lat, lng, need_poi_tag=term.kind == "name")
-        if place is None:
-            continue
-        # The same shop is often mapped twice, as a point and as its building.
-        key = (place["name"].casefold(), round(place["lat"], 4), round(place["lng"], 4))
-        if key in seen:
-            continue
-        seen.add(key)
-        places.append(place)
-    places.sort(key=lambda p: (p["distance_m"], p["name"]))
-    truncated = len(elements) >= OVERPASS_ELEMENT_LIMIT or len(places) > MAX_PLACES
-    return places[:MAX_PLACES], truncated
 
 
 # ------------------------------------------------------------------ the database
 
 
 class Store:
-    """The app role's whole view of Postgres: eight security definer functions, no tables."""
+    """The app role's view of Postgres: read access to the place data and three functions."""
 
     def __init__(self, conn):
         self._conn = conn
@@ -900,27 +768,31 @@ class Store:
         self._conn.execute("select places.geocode_put(%s, %s, %s, %s, %s)",
                            (query, geo.found, geo.lat, geo.lng, geo.label))
 
-    def results_get(self, term_key, lat_e3, lng_e3, radius):
-        row = self._row("select places, truncated, fetched_at from places.results_get(%s, %s, %s, %s)",
-                        (term_key, lat_e3, lng_e3, radius))
-        return None if row is None else (row[0], row[1], row[2])
+    def neighborhood(self, alias, borocode):
+        """(label, borough, lat, lng) for a neighborhood or park name, or None."""
+        return self._row(
+            "select n.label, n.boroname, n.lat, n.lng from places.neighborhoods n"
+            " where n.alias = %s and (%s::smallint is null or n.borocode = %s)"
+            " order by n.borocode limit 1",
+            (alias, borocode, borocode),
+        )
 
-    def results_put(self, term_key, lat_e3, lng_e3, radius, places, truncated):
-        row = self._row("select places.results_put(%s, %s, %s, %s, %s::jsonb, %s)",
-                        (term_key, lat_e3, lng_e3, radius, json.dumps(places), truncated))
-        return row[0] if row else None
+    def take_slot(self, kind, visitor, per_visitor, per_day):
+        return self._row("select places.take_slot(%s, %s, %s, %s)", (kind, visitor, per_visitor, per_day))[0]
 
-    def begin_live_search(self, visitor, per_visitor, upstream_limit):
-        return self._row("select places.begin_live_search(%s, %s, %s)", (visitor, per_visitor, upstream_limit))[0]
+    def area_of(self, lat, lng):
+        """(borough name or None, the loaded data release)."""
+        return self._row(
+            "select (select b.boroname from places.boroughs b"
+            "         where st_intersects(b.geom, st_setsrid(st_makepoint(%s, %s), 4326))"
+            "         order by b.borocode limit 1),"
+            "       (select m.value from places.meta m where m.key = 'release')",
+            (lng, lat),
+        )
 
-    def take_upstream_slot(self, upstream_limit):
-        return bool(self._row("select places.take_upstream_slot(%s)", (upstream_limit,))[0])
-
-    def reserve_call(self, upstream, max_wait_ms):
-        return self._row("select places.reserve_call(%s, %s)", (upstream, max_wait_ms))[0]
-
-    def pause_upstream(self, upstream, seconds):
-        self._conn.execute("select places.pause_upstream(%s, %s)", (upstream, seconds))
+    def search_places(self, term, lat, lng, radius, limit):
+        sql, params = search_params(term, lat, lng, radius, limit)
+        return self._conn.execute(sql, params).fetchall()
 
 
 @contextmanager
@@ -938,16 +810,12 @@ def open_store(url):
 
 
 def _best_effort(action, *args):
-    """A cache write. The upstream call has already happened, so a failed write only costs a cache hit."""
+    """A cache write. The geocoder call has already happened, so a failed write only costs a cache hit."""
     try:
         return action(*args)
     except Exception as exc:
         print(f"search: cache write skipped ({type(exc).__name__})")
         return None
-
-
-def _iso(moment):
-    return moment.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 # ------------------------------------------------------------------ the search
@@ -959,51 +827,56 @@ def search(data, ip, settings):
         print("search: PLACES_DB_URL or PLACES_HASH_SALT is not set, refusing")
         raise unavailable()
     visitor = visitor_key(ip, settings.hash_salt)
-    deadline = Deadline(REQUEST_BUDGET_S)
     try:
         with open_store(settings.db_url) as store:
-            return _search(store, request, visitor, settings, deadline)
+            return _search(store, request, visitor, settings)
     except SearchFailure:
         raise
     except Exception as exc:
         # Fail closed: an error here usually means the database, and without it there are no
-        # limits, no pacing and no cache, so nothing runs.
+        # limits and no data, so nothing runs.
         print(f"search: refused after {type(exc).__name__}")
         raise unavailable() from None
 
 
-def _search(store, request, visitor, settings, deadline):
-    budget = LiveBudget(store, visitor, settings)
+def resolve_neighborhood(store, text):
+    """A neighborhood, park or borough name from NYC's own list, without calling the geocoder."""
+    for alias, borocode in neighborhood_candidates(text):
+        if len(alias) < 3:
+            continue
+        row = store.neighborhood(alias, borocode)
+        if row is not None:
+            label, borough, lat, lng = row
+            shown = label if label in (borough, "The Bronx") else f"{label}, {borough}"
+            return Geocode(found=True, lat=float(lat), lng=float(lng), label=shown)
+    return None
+
+
+def _search(store, request, visitor, settings):
+    take(store, "search", visitor, settings)
     location = None
     if request.where is not None:
-        geo = store.geocode_get(request.where)
+        geo = resolve_neighborhood(store, request.where_text) or store.geocode_get(request.where)
         if geo is None:
-            geo = geocode_live(store, budget, request.where, settings, deadline)
+            take(store, "geocode", visitor, settings)
+            geo = geocode_live(request.where, settings)
             _best_effort(store.geocode_put, request.where, geo)
         if not geo.found:
             raise SearchFailure(
                 "not_found",
-                f"Couldn't find \u201c{request.where_text}\u201d. Try a neighborhood, city or postal code.",
+                f"Couldn't find “{request.where_text}” in New York City. Try a neighborhood or a "
+                "street address in one of the five boroughs.",
             )
         lat, lng, location = geo.lat, geo.lng, geo.label
     else:
         lat, lng = request.lat, request.lng
 
-    # Rounded to 0.001 degrees, about 110 meters of latitude: nearby searches share one cache entry,
-    # and the query runs around the rounded point so the entry matches its key exactly.
-    lat_e3, lng_e3 = round(lat * 1000), round(lng * 1000)
-    clat, clng = lat_e3 / 1000, lng_e3 / 1000
+    borough, release = store.area_of(lat, lng)
+    if borough is None:
+        raise out_of_area(request.where_text)
+    rows = store.search_places(request.term, lat, lng, request.radius, MAX_PLACES + 1)
+    places = [place_from_row(row) for row in rows[:MAX_PLACES]]
     term = request.term
-    hit = store.results_get(term.cache_key, lat_e3, lng_e3, request.radius)
-    if hit is not None:
-        places, truncated, fetched_at = hit
-        cached = True
-    else:
-        elements = fetch_elements(store, budget, build_query(term, clat, clng, request.radius), settings, deadline)
-        places, truncated = normalize_places(elements, term, clat, clng)
-        fetched_at = _best_effort(store.results_put, term.cache_key, lat_e3, lng_e3, request.radius,
-                                  places, truncated) or datetime.now(timezone.utc)
-        cached = False
     return {
         "ok": True,
         "query": {
@@ -1011,12 +884,12 @@ def _search(store, request, visitor, settings, deadline):
             "term": {"kind": term.kind, "key": term.key, "label": term.label},
             "radius_m": request.radius,
         },
-        "center": {"lat": clat, "lng": clng},
+        "center": {"lat": round(lat, 6), "lng": round(lng, 6)},
         "location": location,
+        "borough": borough,
         "places": places,
-        "truncated": bool(truncated),
-        "cached": cached,
-        "fetched_at": _iso(fetched_at),
+        "truncated": len(rows) > MAX_PLACES,
+        "data_release": release,
     }
 
 

@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from conftest import ROOT, FakeClock, FakeStore, FakeUpstream, load_module
+from conftest import ROOT, FakeClock, FakeGeoSearch, FakeStore, load_module
 
 
 @pytest.fixture(scope="module")
@@ -85,15 +85,14 @@ def test_dev_env_parsing(dev_api, tmp_path):
 def dev_server(dev_api, monkeypatch):
     search = dev_api.load_search()
     clock = FakeClock()
-    store = FakeStore(clock)
+    store = FakeStore(clock, search)
 
     @contextmanager
     def fake_open_store(url):
         yield store
 
     monkeypatch.setattr(search, "open_store", fake_open_store)
-    monkeypatch.setattr(search, "http_request", FakeUpstream(clock, search.Reply))
-    monkeypatch.setattr(search, "sleep", clock.sleep)
+    monkeypatch.setattr(search, "http_request", FakeGeoSearch(clock, search.Reply))
     monkeypatch.setenv("PLACES_DB_URL", "postgresql://fake")
     monkeypatch.setenv("PLACES_HASH_SALT", "s")
     monkeypatch.delenv("PLACES_ALLOWED_ORIGINS", raising=False)
@@ -109,7 +108,7 @@ def dev_server(dev_api, monkeypatch):
 
 def post(port, path, origin="http://localhost:5174"):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-    body = json.dumps({"what": "coffee", "where": "somewhere"})
+    body = json.dumps({"what": "coffee", "where": "Greenwich Village"})
     conn.request("POST", path, body=body, headers={"Content-Type": "application/json", "Origin": origin})
     resp = conn.getresponse()
     return resp.status, json.loads(resp.read())
@@ -123,3 +122,41 @@ def test_dev_server_serves_the_function_for_the_vite_origin(dev_server):
 
 def test_dev_server_answers_only_the_deployed_path(dev_server):
     assert post(dev_server, "/api/other")[0] == 404
+
+
+# ------------------------------------------------------------------ the data pipeline
+
+
+@pytest.fixture(scope="module")
+def pipeline():
+    return load_module(ROOT / "scripts" / "load_places.py", "place_pipeline_for_tests")
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("Greenwich Village", {"greenwich village": "Greenwich Village"}),
+    ("SoHo-Little Italy-Hudson Square", {"soho little italy hudson square": "SoHo-Little Italy-Hudson Square",
+                                         "soho": "SoHo", "little italy": "Little Italy", "hudson square": "Hudson Square"}),
+    ("Bedford-Stuyvesant (East)", {"bedford stuyvesant": "Bedford-Stuyvesant", "bedford": "Bedford",
+                                   "stuyvesant": "Stuyvesant"}),
+    ("St. Michael's Cemetery", {"st michaels cemetery": "St. Michael's Cemetery"}),
+])
+def test_neighborhood_aliases(pipeline, name, expected):
+    assert pipeline.nta_aliases(name) == expected
+
+
+def test_aliases_fold_like_the_search_does(pipeline, search_mod):
+    for alias in pipeline.nta_aliases("Astoria (North)-Ditmars-Steinway"):
+        assert alias == search_mod.fold(alias)
+
+
+@pytest.mark.parametrize("text,mib", [
+    ("HTTPFS HTTP Stats in: 138.7 MiB #GET: 40", 138.7), ("in: 512.0 KiB", 0.5), ("in: 2.0 GiB", 2048.0), ("none", 0.0),
+])
+def test_bytes_read_comes_from_the_duckdb_profile(pipeline, text, mib):
+    assert pipeline.http_mib(text) == pytest.approx(mib)
+
+
+def test_default_floor_and_size_target(pipeline):
+    assert pipeline.DEFAULT_MIN_CONFIDENCE == 0.7
+    assert pipeline.DEFAULT_MAX_MB == 200
+    assert pipeline.DEFAULT_RELEASE == "2026-10-21.0"

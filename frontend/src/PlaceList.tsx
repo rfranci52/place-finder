@@ -48,24 +48,19 @@ export default function PlaceList({ places, selectedId, hoveredId, onSelect, onH
               {p.category} <span aria-hidden="true">·</span> {formatDistance(p.distance_m)}
               <span className="sr-only"> away</span>
             </p>
-            {p.address && <p className="place-line">{p.address}</p>}
-            {p.hours && (
-              <p className="place-line place-hours">
-                <span className="sr-only">Opening hours: </span>
-                {p.hours}
+            {(p.address || p.borough) && (
+              <p className="place-line">{[p.address, p.borough].filter(Boolean).join(' · ')}</p>
+            )}
+            {(p.phone || p.website) && (
+              <p className="place-links">
+                {p.phone && <a href={telHref(p.phone)}>{p.phone}</a>}
+                {p.website && (
+                  <a href={p.website} target="_blank" rel="noopener noreferrer">
+                    Website<span className="sr-only"> of {p.name} (opens in a new tab)</span>
+                  </a>
+                )}
               </p>
             )}
-            <p className="place-links">
-              {p.phone && <a href={telHref(p.phone)}>{p.phone}</a>}
-              {p.website && (
-                <a href={p.website} target="_blank" rel="noopener noreferrer">
-                  Website<span className="sr-only"> of {p.name} (opens in a new tab)</span>
-                </a>
-              )}
-              <a href={p.osm_url} target="_blank" rel="noopener noreferrer">
-                OpenStreetMap<span className="sr-only"> entry for {p.name} (opens in a new tab)</span>
-              </a>
-            </p>
           </li>
         )
       })}

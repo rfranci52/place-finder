@@ -1,4 +1,4 @@
-// Small display helpers: distances, the search radius, and how old cached data is.
+// Small display helpers: distances, the search radius and the data release.
 
 const MILE_LOCALES = /^en-(US|LR)|^my\b/i
 const useMiles = MILE_LOCALES.test(typeof navigator === 'undefined' ? 'en-US' : navigator.language || 'en-US')
@@ -17,14 +17,12 @@ export function formatRadius(meters: number): string {
   return useMiles ? `${(meters / 1609.344).toFixed(1)} mi` : `${(meters / 1000).toFixed(1)} km`
 }
 
-const relative = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' })
-
-export function formatAge(iso: string, now = Date.now()): string {
-  const seconds = Math.round((Date.parse(iso) - now) / 1000)
-  if (!Number.isFinite(seconds) || seconds > -60) return 'just now'
-  const minutes = Math.round(seconds / 60)
-  if (minutes > -60) return relative.format(minutes, 'minute')
-  return relative.format(Math.round(minutes / 60), 'hour')
+// "2026-10-21.0" reads as "October 2026".
+export function formatRelease(release: string | null): string {
+  const match = /^(\d{4})-(\d{2})/.exec(release ?? '')
+  if (!match) return ''
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, 1))
+  return date.toLocaleDateString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })
 }
 
 // The digits and a leading plus, for a tel: link.

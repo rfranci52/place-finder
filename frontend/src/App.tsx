@@ -1,18 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { SearchError, searchPlaces, type ErrorCode, type SearchInput, type SearchResult } from './api'
-import { formatAge, formatRadius } from './format'
+import { formatRadius, formatRelease } from './format'
 import MapView, { type AreaRequest } from './MapView'
 import PlaceList from './PlaceList'
 import SearchForm from './SearchForm'
 
 const DEFAULT_WHAT = 'Coffee'
-const DEFAULT_WHERE = 'Washington Square Park, New York'
+const DEFAULT_WHERE = 'Greenwich Village'
 
 const ERROR_TITLES: Record<ErrorCode, string> = {
   invalid: 'Check your search',
   not_found: 'Location not found',
+  out_of_area: 'Outside New York City',
   rate_limited: 'Daily limit reached',
-  upstream_busy: 'OpenStreetMap is busy',
+  upstream_busy: 'Address lookup unavailable',
   unavailable: 'Search is paused',
   network: 'Connection problem',
   forbidden: 'Search unavailable',
@@ -41,6 +42,8 @@ export default function App() {
   const [fit, setFit] = useState(true)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [hoveredId, setHoveredId] = useState<string | null>(null)
+  // Whether the location field was edited since the last search: a chip then uses what was typed.
+  const [whereEdited, setWhereEdited] = useState(false)
   const latest = useRef(0)
   const started = useRef(false)
 
@@ -49,6 +52,7 @@ export default function App() {
     setLoading(true)
     setError(null)
     setLastInput(input)
+    setWhereEdited(false)
     try {
       const found = await searchPlaces(input)
       if (id !== latest.current) return
@@ -77,11 +81,17 @@ export default function App() {
     run({ what: what.trim(), where: where.trim() })
   }
 
-  // A chip searches the same place as the last search: the typed location or the map area.
+  // A chip searches the same place as the last search (the typed location or the map area),
+  // unless a new location has been typed since.
   function chip(label: string) {
     setWhat(label)
-    if (lastInput && 'lat' in lastInput) run({ ...lastInput, what: label })
+    if (lastInput && 'lat' in lastInput && !whereEdited) run({ ...lastInput, what: label })
     else run({ what: label, where: where.trim() || DEFAULT_WHERE })
+  }
+
+  function editWhere(value: string) {
+    setWhere(value)
+    setWhereEdited(true)
   }
 
   function searchArea(area: AreaRequest) {
@@ -113,16 +123,14 @@ export default function App() {
       <main className="layout">
         <section className="intro" aria-labelledby="title">
           <h1 id="title">Place Finder</h1>
-          <p className="tagline">
-            Nearby places from OpenStreetMap, the free map of the world built by volunteers.
-          </p>
+          <p className="tagline">Search places across New York City&apos;s five boroughs.</p>
           <SearchForm
             what={what}
             where={where}
             busy={loading}
             activeTerm={activeTerm}
             onWhat={setWhat}
-            onWhere={setWhere}
+            onWhere={editWhere}
             onSubmit={submit}
             onChip={chip}
           />
@@ -151,9 +159,8 @@ export default function App() {
                 <div className="summary">
                   <p className="summary-main" aria-hidden="true">{summarize(result)}</p>
                   <p className="summary-meta">
-                    {result.cached ? `Cached ${formatAge(result.fetched_at)}` : 'Fresh from OpenStreetMap'}
-                    {' · within '}
-                    {formatRadius(result.query.radius_m)}
+                    Within {formatRadius(result.query.radius_m)}
+                    {result.data_release && ` · Overture Maps data, ${formatRelease(result.data_release)} release`}
                   </p>
                 </div>
                 {places.length === 0 ? (
@@ -180,26 +187,34 @@ export default function App() {
 
           <footer className="credits">
             <p>
-              Place data &copy;{' '}
-              <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, available under
-              the Open Database License. Spot a mistake?{' '}
-              <a href="https://www.openstreetmap.org/fixthemap">Report a map issue</a>.
+              Place data from the <a href="https://overturemaps.org">Overture Maps Foundation</a>, built from
+              sources including Meta, Microsoft, Foursquare and AllThePlaces, under the Community Data License
+              Agreement (CDLA) Permissive 2.0, Apache 2.0 and Creative Commons Zero (CC0) licenses. Foursquare
+              data &copy; 2024 Foursquare Labs, Inc.{' '}
+              <a href="https://docs.overturemaps.org/attribution/">Full attribution</a>.
+            </p>
+            <p>
+              Neighborhoods and borough boundaries from{' '}
+              <a href="https://opendata.cityofnewyork.us/">NYC Open Data</a>; addresses located by{' '}
+              <a href="https://geosearch.planninglabs.nyc/">NYC GeoSearch</a>, both from the NYC Department of City
+              Planning. Map tiles &copy;{' '}
+              <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>.
             </p>
             <p>
               <a href="https://github.com/rfranci52/react-google-maps">Rebuilt from a 2019 bootcamp project</a>{' '}
-              that called Google Maps and Yelp straight from the browser.
+              that called Yelp straight from the browser.
             </p>
             <details>
-              <summary>How this demo stays inside the free services&apos; limits</summary>
+              <summary>How the data and the search work</summary>
               <ul>
-                <li>Locations are cached for 30 days and place lists for 24 hours, so a repeat search calls nothing.</li>
-                <li>Location lookups start at least one second apart, across every server instance.</li>
-                <li>Each visitor gets a small daily allowance of new searches, and the whole site a fixed daily share of calls.</li>
+                <li>The places are this site&apos;s own copy of Overture Maps data for the five boroughs, refreshed monthly.</li>
+                <li>Neighborhood names are looked up locally; only street addresses go to NYC GeoSearch, and each answer is kept for 30 days.</li>
+                <li>Each visitor gets a daily allowance of searches and of new address lookups.</li>
               </ul>
             </details>
             <p className="privacy">
-              What you search is sent to OpenStreetMap&apos;s Nominatim and Overpass services. Your internet
-              address is never stored; a salted hash of it counts your new searches each day.
+              A street address you type is sent to NYC GeoSearch. Your internet address is never stored; a salted
+              hash of it counts your searches each day.
             </p>
           </footer>
         </div>

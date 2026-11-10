@@ -1,10 +1,10 @@
-"""Shared fakes. Apart from test_schema_pg.py, which needs a local Postgres, nothing in the
-suite touches a network or a database: the upstream services, the database and the clock
-are all replaced in memory."""
+"""Shared fakes. Apart from test_schema_pg.py, which needs a local PostGIS, nothing in the suite
+touches a network or a database: the geocoder, the database and the clock are replaced in memory."""
 import email.message
 import importlib.util
 import io
 import json
+import math
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SEARCH_PY = ROOT / "frontend" / "api" / "search.py"
 ORIGIN = "https://places.example.test"
 SALT = "test-salt"
+RELEASE = "2026-10-21.0"
 
 
 def load_module(path, name):
@@ -37,19 +38,14 @@ def search_mod():
 
 
 class FakeClock:
-    """Monotonic seconds and wall-clock time that move only when told to (or when code sleeps)."""
+    """Monotonic seconds and wall-clock time that move only when told to."""
 
     def __init__(self):
         self.t = 1000.0
         self.wall = datetime(2026, 11, 9, 15, 0, tzinfo=timezone.utc)
-        self.sleeps = []
 
     def monotonic(self):
         return self.t
-
-    def sleep(self, seconds):
-        self.sleeps.append(seconds)
-        self.advance(seconds)
 
     def advance(self, seconds):
         self.t += seconds
@@ -59,20 +55,52 @@ class FakeClock:
 # ------------------------------------------------------------------ the database
 
 
-class FakeStore:
-    """The eight database functions, with the same rules as db/schema.sql, held in memory.
+def place(n, name, category, lat, lng, **extra):
+    row = {"id": f"00000000-0000-4000-8000-{n:012d}", "name": name, "category": category,
+           "street": f"{n} Test St", "locality": "New York", "postcode": "10012", "phone": None,
+           "website": None, "borough": "Manhattan", "lat": lat, "lng": lng}
+    row.update(extra)
+    return row
 
-    test_schema_pg.py runs the same scenarios against the real SQL, so the two stay honest.
+
+# Around Washington Square Park, which the fake neighborhood "greenwich village" points at.
+PLACES = [
+    place(1, "Cafe Uno", "coffee_shop", 40.7310, -73.9970, phone="+12125550100", website="https://cafe-uno.example"),
+    place(2, "Bean Bar", "cafe", 40.7320, -73.9980),
+    place(3, "Joe's Pizza", "pizza_restaurant", 40.7305, -74.0020),
+    place(4, "Thai Garden", "thai_restaurant", 40.7290, -73.9990),
+    place(5, "Village Pharmacy", "pharmacy", 40.7330, -73.9960),
+    place(6, "Far Away Cafe", "coffee_shop", 40.7600, -73.9800),  # about 3.5 km away
+]
+NEIGHBORHOODS = {
+    ("greenwich village", 1): ("Greenwich Village", "Manhattan", 40.7307, -73.9957),
+    ("williamsburg", 3): ("Williamsburg", "Brooklyn", 40.7153, -73.9599),
+    ("chelsea", 1): ("Chelsea", "Manhattan", 40.7501, -74.0021),
+    ("chelsea", 5): ("Chelsea", "Staten Island", 40.5940, -74.1890),
+    ("brooklyn", 3): ("Brooklyn", "Brooklyn", 40.6484, -73.9528),
+}
+
+
+def distance_m(lat1, lng1, lat2, lng2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    a = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lng2 - lng1) / 2) ** 2
+    return 2 * 6_371_000 * math.asin(math.sqrt(a))
+
+
+class FakeStore:
+    """The database calls, with the same rules as db/schema.sql and the search SQL, in memory.
+
+    test_schema_pg.py runs the same behaviors against the real SQL, so the two stay honest.
     """
 
-    INTERVALS = {"nominatim": 1.1, "overpass": 1.0, "overpass-mirror": 1.0}
-
-    def __init__(self, clock):
+    def __init__(self, clock, search_mod):
         self.clock = clock
+        self.mod = search_mod
         self.geocodes = {}
-        self.results = {}
         self.counts = {}
-        self.next_at = {name: float("-inf") for name in self.INTERVALS}
+        self.places = [dict(p) for p in PLACES]
+        self.neighborhoods = dict(NEIGHBORHOODS)
+        self.release = RELEASE
         self.calls = []
         self.fail_on = set()  # method names that raise, to simulate a database error
 
@@ -85,6 +113,27 @@ class FakeStore:
     def today(self):
         return self.clock.wall.date()
 
+    def count(self, key):
+        return self.counts.get((self.today, key), 0)
+
+    def take_slot(self, kind, visitor, per_visitor, per_day):
+        self._call("take_slot", kind, visitor, per_visitor, per_day)
+        assert kind in ("search", "geocode")
+        vkey, skey = (self.today, f"{kind}:v:{visitor}"), (self.today, f"{kind}:site")
+        if per_visitor <= 0 or self.counts.get(vkey, 0) >= per_visitor:
+            return "visitor_limit"
+        if per_day <= 0 or self.counts.get(skey, 0) >= per_day:
+            return "site_limit"
+        self.counts[vkey] = self.counts.get(vkey, 0) + 1
+        self.counts[skey] = self.counts.get(skey, 0) + 1
+        return "ok"
+
+    def neighborhood(self, alias, borocode):
+        self._call("neighborhood", alias, borocode)
+        matches = sorted((code, row) for (a, code), row in self.neighborhoods.items()
+                         if a == alias and (borocode is None or code == borocode))
+        return matches[0][1] if matches else None
+
     def geocode_get(self, query):
         self._call("geocode_get", query)
         hit = self.geocodes.get(query)
@@ -96,138 +145,74 @@ class FakeStore:
         self._call("geocode_put", query, geo)
         self.geocodes[query] = (geo, self.clock.wall)
 
-    def results_get(self, term_key, lat_e3, lng_e3, radius):
-        self._call("results_get", term_key, lat_e3, lng_e3, radius)
-        hit = self.results.get((term_key, lat_e3, lng_e3, radius))
-        if hit and self.clock.wall - hit[2] < timedelta(hours=24):
-            return hit
-        return None
+    def area_of(self, lat, lng):
+        self._call("area_of", lat, lng)
+        inside = 40.49 <= lat <= 40.92 and -74.26 <= lng <= -73.70 and not (lng < -74.03 and lat > 40.65)
+        return ("Manhattan" if inside else None), self.release
 
-    def results_put(self, term_key, lat_e3, lng_e3, radius, places, truncated):
-        self._call("results_put", term_key, lat_e3, lng_e3, radius, places, truncated)
-        assert len(places) <= 60
-        json.dumps(places)  # must be storable as jsonb
-        self.results[(term_key, lat_e3, lng_e3, radius)] = (places, truncated, self.clock.wall)
-        return self.clock.wall
-
-    def count(self, key):
-        return self.counts.get((self.today, key), 0)
-
-    def begin_live_search(self, visitor, per_visitor, upstream_limit):
-        self._call("begin_live_search", visitor, per_visitor, upstream_limit)
-        vkey = (self.today, "v:" + visitor)
-        gkey = (self.today, "upstream")
-        if per_visitor <= 0 or self.counts.get(vkey, 0) >= per_visitor:
-            return "visitor_limit"
-        if upstream_limit <= 0 or self.counts.get(gkey, 0) >= upstream_limit:
-            return "global_limit"
-        self.counts[vkey] = self.counts.get(vkey, 0) + 1
-        self.counts[gkey] = self.counts.get(gkey, 0) + 1
-        return "ok"
-
-    def take_upstream_slot(self, upstream_limit):
-        self._call("take_upstream_slot", upstream_limit)
-        gkey = (self.today, "upstream")
-        if self.counts.get(gkey, 0) >= upstream_limit:
-            return False
-        self.counts[gkey] = self.counts.get(gkey, 0) + 1
-        return True
-
-    def reserve_call(self, upstream, max_wait_ms):
-        self._call("reserve_call", upstream, max_wait_ms)
-        now = self.clock.monotonic()
-        start = max(self.next_at[upstream], now)
-        wait_ms = round((start - now) * 1000)
-        if wait_ms > max_wait_ms:
-            return None
-        self.next_at[upstream] = start + self.INTERVALS[upstream]
-        return wait_ms
-
-    def pause_upstream(self, upstream, seconds):
-        self._call("pause_upstream", upstream, seconds)
-        self.next_at[upstream] = max(self.next_at[upstream], self.clock.monotonic() + min(max(seconds, 0), 300))
+    def search_places(self, term, lat, lng, radius, limit):
+        self._call("search_places", term, lat, lng, radius, limit)
+        sql, params = self.mod.search_params(term, lat, lng, radius, limit)  # the real parameter builder
+        if term.kind == "category":
+            match = lambda p: p["category"] in params["categories"]  # noqa: E731
+        else:
+            slug = params["slug"]
+            match = lambda p: (term.key in p["name"].lower() or p["category"] == slug  # noqa: E731
+                               or p["category"].startswith(slug + "_") or p["category"].endswith("_" + slug))
+        rows = []
+        for p in self.places:
+            d = distance_m(lat, lng, p["lat"], p["lng"])
+            if d <= radius and match(p):
+                rows.append((d, (p["id"], p["name"], p["category"], p["street"], p["locality"], p["postcode"],
+                                 p["phone"], p["website"], p["borough"], p["lat"], p["lng"], d)))
+        rows.sort(key=lambda r: r[0])
+        return [r for _, r in rows[:limit]]
 
 
-# ------------------------------------------------------------------ the upstream services
+# ------------------------------------------------------------------ the geocoder
 
 
 @dataclass
 class Call:
-    service: str
     url: str
-    user_agent: str
     timeout: float
-    form: dict | None
     at: float
 
     @property
     def params(self):
         return {k: v[0] for k, v in parse_qs(urlsplit(self.url).query).items()}
 
-    @property
-    def query(self):
-        return (self.form or {}).get("data", "")
 
-
-def nominatim_body(lat=40.7308, lng=-73.9973, name="Washington Square Park, Manhattan, New York County, New York"):
-    return json.dumps([{"lat": str(lat), "lon": str(lng), "display_name": name}]).encode()
-
-
-def overpass_body(elements, remark=None):
-    data = {"version": 0.6, "elements": elements}
-    if remark:
-        data["remark"] = remark
-    return json.dumps(data).encode()
-
-
-def node(osm_id, lat, lng, **tags):
-    return {"type": "node", "id": osm_id, "lat": lat, "lon": lng, "tags": tags}
-
-
-def way(osm_id, lat, lng, **tags):
-    return {"type": "way", "id": osm_id, "center": {"lat": lat, "lon": lng}, "nodes": [1, 2, 3], "tags": tags}
-
-
-DEFAULT_ELEMENTS = [
-    node(1, 40.7310, -73.9970, name="Cafe Uno", amenity="cafe", opening_hours="Mo-Fr 07:00-18:00",
-         website="https://cafe-uno.example", phone="+1 212 555 0100"),
-    way(2, 40.7320, -73.9980, name="Bean Shop", shop="coffee", **{"addr:housenumber": "12", "addr:street": "Main St"}),
-]
+def geosearch_body(label="350 5 AVENUE, New York, NY, USA", lat=40.748441, lng=-73.985656, confidence=0.8):
+    return json.dumps({"type": "FeatureCollection", "features": [{
+        "type": "Feature", "geometry": {"type": "Point", "coordinates": [lng, lat]},
+        "properties": {"label": label, "confidence": confidence, "layer": "venue", "match_type": "fallback"},
+    }]}).encode()
 
 
 @dataclass
-class FakeUpstream:
-    """Scripted (status, body) replies per service, with a default answer for each."""
+class FakeGeoSearch:
+    """Scripted (status, body) replies; by default an exact echo of the query at Midtown."""
 
     clock: FakeClock
     reply_type: type
-    scripts: dict = field(default_factory=dict)
+    scripts: list = field(default_factory=list)
     calls: list = field(default_factory=list)
 
-    def service_for(self, url):
-        if "nominatim" in url:
-            return "nominatim"
-        if "private.coffee" in url or "mirror" in url:
-            return "overpass-mirror"
-        return "overpass"
+    def script(self, *replies):
+        self.scripts.extend(replies)
 
-    def script(self, service, *replies):
-        self.scripts.setdefault(service, []).extend(replies)
-
-    def __call__(self, url, *, user_agent, timeout, form=None):
-        service = self.service_for(url)
-        self.calls.append(Call(service, url, user_agent, timeout, form, self.clock.monotonic()))
-        queue = self.scripts.get(service)
-        if queue:
-            status, body = queue.pop(0)
-        elif service == "nominatim":
-            status, body = 200, nominatim_body()
+    def __call__(self, url, *, timeout):
+        self.calls.append(Call(url, timeout, self.clock.monotonic()))
+        if self.scripts:
+            status, body = self.scripts.pop(0)
         else:
-            status, body = 200, overpass_body(DEFAULT_ELEMENTS)
+            text = parse_qs(urlsplit(url).query)["text"][0]
+            status, body = 200, geosearch_body(label=f"{text.upper()}, New York, NY, USA")
         return self.reply_type(status, body)
 
-    def count(self, service=None):
-        return sum(1 for c in self.calls if service is None or c.service == service)
+    def count(self):
+        return len(self.calls)
 
 
 # ------------------------------------------------------------------ wiring
@@ -238,7 +223,7 @@ class World:
     mod: object
     clock: FakeClock
     store: FakeStore
-    upstream: FakeUpstream
+    geosearch: FakeGeoSearch
     monkeypatch: object
 
     def env(self, **values):
@@ -300,8 +285,8 @@ def run_handler(handler_class, method, headers, body):
 @pytest.fixture
 def world(search_mod, monkeypatch):
     clock = FakeClock()
-    store = FakeStore(clock)
-    upstream = FakeUpstream(clock, search_mod.Reply)
+    store = FakeStore(clock, search_mod)
+    geosearch = FakeGeoSearch(clock, search_mod.Reply)
 
     @contextmanager
     def fake_open_store(url):
@@ -310,8 +295,7 @@ def world(search_mod, monkeypatch):
         yield store
 
     monkeypatch.setattr(search_mod, "open_store", fake_open_store)
-    monkeypatch.setattr(search_mod, "http_request", upstream)
-    monkeypatch.setattr(search_mod, "sleep", clock.sleep)
+    monkeypatch.setattr(search_mod, "http_request", geosearch)
     monkeypatch.setattr(search_mod, "monotonic", clock.monotonic)
     for key in list(__import__("os").environ):
         if key.startswith("PLACES_"):
@@ -319,7 +303,8 @@ def world(search_mod, monkeypatch):
     monkeypatch.setenv("PLACES_DB_URL", "postgresql://fake")
     monkeypatch.setenv("PLACES_HASH_SALT", SALT)
     monkeypatch.setenv("PLACES_ALLOWED_ORIGINS", ORIGIN)
-    return World(search_mod, clock, store, upstream, monkeypatch)
+    return World(search_mod, clock, store, geosearch, monkeypatch)
 
 
-COFFEE_NEAR_PARK = {"what": "Coffee", "where": "Washington Square Park, New York"}
+NEAR_THE_PARK = {"what": "Coffee", "where": "Greenwich Village"}
+ADDRESS = {"what": "Coffee", "where": "350 5th Ave"}

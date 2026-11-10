@@ -1,138 +1,56 @@
-"""Turning Overpass elements into the place list: up to 60, nearest first, safe links only."""
-from conftest import COFFEE_NEAR_PARK, node, overpass_body, way
-
-CENTER = (40.731, -73.997)
+"""The place list: nearest first, at most 60, safe links, readable labels."""
+from conftest import NEAR_THE_PARK, place
 
 
-def run(world, elements, what="coffee"):
-    world.upstream.script("overpass", (200, overpass_body(elements)))
-    resp = world.post({"what": what, "lat": CENTER[0], "lng": CENTER[1]})
-    assert resp.status == 200, resp.json
-    return resp.json
-
-
-def test_at_most_60_places_nearest_first(world):
-    elements = [node(i, 40.731 + i * 0.0001, -73.997, name=f"Cafe {i:03d}", amenity="cafe") for i in range(1, 120)]
-    body = run(world, list(reversed(elements)))
-    names = [p["name"] for p in body["places"]]
-    assert len(names) == 60
-    assert names == [f"Cafe {i:03d}" for i in range(1, 61)]
-    distances = [p["distance_m"] for p in body["places"]]
+def test_nearest_first_within_the_radius(world):
+    resp = world.post(NEAR_THE_PARK)
+    names = [p["name"] for p in resp.json["places"]]
+    assert names == ["Cafe Uno", "Bean Bar"]  # Far Away Cafe is outside 1.5 km
+    distances = [p["distance_m"] for p in resp.json["places"]]
     assert distances == sorted(distances)
-    assert body["truncated"] is True
+    wide = world.post({**NEAR_THE_PARK, "radius": 2500})
+    assert "Far Away Cafe" not in [p["name"] for p in wide.json["places"]]
 
 
-def test_a_full_overpass_page_is_reported_as_truncated(world, search_mod):
-    elements = [node(i, 40.731, -73.997, amenity="cafe") for i in range(1, search_mod.OVERPASS_ELEMENT_LIMIT + 1)]
-    elements[0]["tags"]["name"] = "Only Named"
-    body = run(world, elements)
-    assert [p["name"] for p in body["places"]] == ["Only Named"]
-    assert body["truncated"] is True
+def test_at_most_60_and_truncated_when_there_are_more(world):
+    world.store.places = [place(100 + i, f"Cafe {i:03d}", "cafe", 40.7307 + i * 0.00001, -73.9957) for i in range(75)]
+    resp = world.post(NEAR_THE_PARK)
+    assert len(resp.json["places"]) == 60 and resp.json["truncated"] is True
+    assert [p["name"] for p in resp.json["places"]][:3] == ["Cafe 000", "Cafe 001", "Cafe 002"]
+    search_call = [args for name, args in world.store.calls if name == "search_places"][-1]
+    assert search_call[-1] == 61  # one more than shown, to know whether there are more
 
 
-def test_buildings_use_their_center(world):
-    # The July prototype read center["lng"], which Overpass never sends, and lost every way.
-    body = run(world, [way(5, 40.7315, -73.9965, name="Building Cafe", amenity="cafe")])
-    place, = body["places"]
-    assert (place["lat"], place["lng"]) == (40.7315, -73.9965)
-    assert place["id"] == "way/5"
-    assert place["osm_url"] == "https://www.openstreetmap.org/way/5"
+def test_exactly_60_is_not_truncated(world):
+    world.store.places = [place(100 + i, f"Cafe {i:03d}", "cafe", 40.7307, -73.9957) for i in range(60)]
+    assert world.post(NEAR_THE_PARK).json["truncated"] is False
 
 
-def test_websites_are_https_only(world):
-    sites = {
-        1: "https://good.example/menu?x=1",
-        2: "http://plain.example",
-        3: "javascript:alert(1)",
-        4: "www.no-scheme.example",
-        5: "https://user:pw@evil.example",
-        6: "https://ok.example/<script>",
-        7: "data:text/html,hi",
-        8: "HTTPS://Upper.Example",
-        9: "https:///no-host",
+def test_place_shape(world):
+    first = world.post(NEAR_THE_PARK).json["places"][0]
+    assert first == {
+        "id": "00000000-0000-4000-8000-000000000001", "name": "Cafe Uno", "category": "Coffee shop",
+        "address": "1 Test St, New York 10012", "phone": "+12125550100", "website": "https://cafe-uno.example",
+        "borough": "Manhattan", "lat": 40.731, "lng": -73.997, "distance_m": first["distance_m"],
     }
-    elements = [node(i, 40.731, -73.997 + i * 0.001, name=f"Place {i}", amenity="cafe", website=url) for i, url in sites.items()]
-    body = run(world, elements)
-    got = {p["name"]: p["website"] for p in body["places"]}
-    assert got == {"Place 1": sites[1], "Place 8": sites[8], **{f"Place {i}": "" for i in (2, 3, 4, 5, 6, 7, 9)}}
 
 
-def test_contact_website_and_phone_fallbacks(world):
-    body = run(world, [node(1, 40.731, -73.997, name="A", amenity="cafe", **{
-        "contact:website": "https://a.example", "contact:phone": "+1 (212) 555-0100;+1 212 555 0101"})])
-    place, = body["places"]
-    assert place["website"] == "https://a.example"
-    assert place["phone"] == "+1 (212) 555-0100"
+def test_websites_are_https_only(search_mod):
+    assert search_mod.https_url("https://good.example/menu?x=1") == "https://good.example/menu?x=1"
+    assert search_mod.https_url("HTTPS://Upper.Example/A") == "https://Upper.Example/A"
+    for bad in ("http://plain.example", "javascript:alert(1)", "www.no-scheme.example", "https://user:pw@evil.example",
+                "https://ok.example/<script>", "data:text/html,hi", "https:///no-host", "", None, 7):
+        assert search_mod.https_url(bad) == ""
 
 
-def test_odd_phone_values_are_dropped(world):
-    body = run(world, [node(1, 40.731, -73.997, name="A", amenity="cafe", phone="call us!"),
-                       node(2, 40.732, -73.997, name="B", amenity="cafe", phone="12")])
-    assert {p["phone"] for p in body["places"]} == {""}
+def test_category_labels(search_mod):
+    assert search_mod.category_label("coffee_shop") == "Coffee shop"
+    assert search_mod.category_label("atm") == "ATM (cash machine)"
+    assert search_mod.category_label("doctors_office") == "Doctor's office"
+    assert search_mod.category_label(None) == "Place"
 
 
-def test_unnamed_places_use_brand_or_operator_or_are_dropped(world):
-    body = run(world, [
-        node(1, 40.731, -73.997, amenity="atm", brand="Chase"),
-        node(2, 40.732, -73.997, amenity="atm", operator="Citibank"),
-        node(3, 40.733, -73.997, amenity="atm"),
-    ], what="atm")
-    assert [(p["name"], p["category"]) for p in body["places"]] == [
-        ("Chase", "ATM (cash machine)"), ("Citibank", "ATM (cash machine)")]
-
-
-def test_the_same_place_mapped_twice_appears_once(world):
-    body = run(world, [node(1, 40.73101, -73.99701, name="Twin", amenity="cafe"),
-                       way(2, 40.73102, -73.99702, name="twin", amenity="cafe")])
-    assert len(body["places"]) == 1
-
-
-def test_name_search_drops_streets_and_other_non_places(world):
-    body = run(world, [
-        way(1, 40.731, -73.997, name="Joe's Street", highway="residential"),
-        node(2, 40.731, -73.997, name="Joe's Pizza", amenity="fast_food", cuisine="pizza"),
-    ], what="Joe's")
-    assert [p["name"] for p in body["places"]] == ["Joe's Pizza"]
-    assert body["places"][0]["category"] == "Fast food · pizza"
-
-
-def test_address_hours_and_label(world):
-    body = run(world, [node(1, 40.731, -73.997, name="Corner Bakery", shop="bakery",
-                            opening_hours="Mo-Su 06:00-20:00", **{"addr:housenumber": "10", "addr:street": "Bleecker St",
-                                                                  "addr:city": "New York", "addr:state": "NY",
-                                                                  "addr:postcode": "10012"})], what="bakery")
-    place, = body["places"]
-    assert place["address"] == "10 Bleecker St, New York, NY 10012"
-    assert place["hours"] == "Mo-Su 06:00-20:00"
-    assert place["category"] == "Bakery"
-
-
-def test_control_characters_and_long_values_from_osm_are_cleaned(world):
-    body = run(world, [node(1, 40.731, -73.997, name="Bad\u0000Name‮" + "x" * 300, amenity="cafe",
-                            opening_hours="y" * 500)])
-    place, = body["places"]
-    assert "\u0000" not in place["name"] and "‮" not in place["name"]
-    assert len(place["name"]) <= 100 and len(place["hours"]) <= 160
-
-
-def test_malformed_elements_are_skipped(world):
-    body = run(world, [
-        {"type": "node", "id": 1, "lat": "x", "lon": 1, "tags": {"name": "A", "amenity": "cafe"}},
-        {"type": "way", "id": 2, "tags": {"name": "B", "amenity": "cafe"}},
-        {"type": "area", "id": 3, "lat": 1, "lon": 1, "tags": {"name": "C", "amenity": "cafe"}},
-        {"type": "node", "id": True, "lat": 1, "lon": 1, "tags": {"name": "D", "amenity": "cafe"}},
-        {"type": "node", "id": 5, "lat": 95, "lon": 1, "tags": {"name": "E", "amenity": "cafe"}},
-        "not a dict",
-        node(6, 40.731, -73.997, name="Good", amenity="cafe"),
-    ])
-    assert [p["name"] for p in body["places"]] == ["Good"]
-
-
-def test_an_empty_area_is_a_normal_empty_answer(world):
-    body = run(world, [])
-    assert body["places"] == [] and body["truncated"] is False
-
-
-def test_where_search_returns_the_geocoded_label(world):
-    resp = world.post(COFFEE_NEAR_PARK)
-    assert resp.json["location"].startswith("Washington Square Park")
+def test_missing_parts_leave_no_stray_commas(search_mod):
+    row = ("id", "Name", "cafe", None, None, None, None, None, None, 40.7, -74.0, 12.4)
+    p = search_mod.place_from_row(row)
+    assert (p["address"], p["phone"], p["website"], p["borough"], p["distance_m"]) == ("", "", "", "", 12)

@@ -29,17 +29,14 @@ ROLE = "places_app"
 URL_VARIABLE = "PLACES_DB_URL"
 SALT_VARIABLE = "PLACES_HASH_SALT"
 OWNER_VARIABLE = "PLACES_OWNER_URL"
-TABLES = ("geocode_cache", "results_cache", "daily_counts", "upstreams")
+TABLES = ("geocode_cache", "daily_counts", "boroughs", "neighborhoods", "meta")
+# Tables places_app may read (public data). It may not write to any table.
+READABLE = {"boroughs", "neighborhoods", "meta", "places"}
 # Every function places_app may run. Nothing else in the schema is executable by it or by public.
 FUNCTIONS = (
     "places.geocode_get(text)",
     "places.geocode_put(text, boolean, double precision, double precision, text)",
-    "places.results_get(text, int, int, int)",
-    "places.results_put(text, int, int, int, jsonb, boolean)",
-    "places.begin_live_search(text, int, int)",
-    "places.take_upstream_slot(int)",
-    "places.reserve_call(text, int)",
-    "places.pause_upstream(text, int)",
+    "places.take_slot(text, text, int, int)",
 )
 INTERNAL_FUNCTIONS = ("places.slot_for(text, int)",)
 
@@ -138,14 +135,18 @@ def verify(conn) -> list[str]:
     login = conn.execute("select rolcanlogin from pg_roles where rolname = %s", (ROLE,)).fetchone()
     if not login or not login[0]:
         problems.append(f"{ROLE}: cannot log in")
-    for table in TABLES:
+    tables = list(TABLES)
+    if conn.execute("select to_regclass('places.places') is not null").fetchone()[0]:
+        tables.append("places")  # created by the first data load
+    for table in tables:
         for privilege in ("select", "insert", "update", "delete", "truncate", "references", "trigger"):
             for grantee in ("public", ROLE):
                 has = conn.execute(
                     "select has_table_privilege(%s, %s, %s)", (grantee, f"places.{table}", privilege)
                 ).fetchone()[0]
-                if has:
-                    problems.append(f"{grantee}: unexpected {privilege} on places.{table}")
+                expected = grantee == ROLE and privilege == "select" and table in READABLE
+                if has != expected:
+                    problems.append(f"{grantee}: unexpected {privilege} state on places.{table}")
     for function in FUNCTIONS + INTERNAL_FUNCTIONS:
         for grantee in ("public", ROLE):
             has = conn.execute(

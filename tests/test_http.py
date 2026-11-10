@@ -8,7 +8,7 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from conftest import COFFEE_NEAR_PARK, ORIGIN
+from conftest import NEAR_THE_PARK, ORIGIN
 
 
 @pytest.mark.parametrize("origin", [
@@ -17,14 +17,14 @@ from conftest import COFFEE_NEAR_PARK, ORIGIN
     "https://places.example.test:8443", "javascript:alert(1)",
 ])
 def test_foreign_or_missing_origin_is_403(world, origin):
-    resp = world.post(COFFEE_NEAR_PARK, origin=origin)
+    resp = world.post(NEAR_THE_PARK, origin=origin)
     assert resp.status == 403 and resp.code == "forbidden"
-    assert world.upstream.count() == 0
+    assert world.geosearch.count() == 0
 
 
 @pytest.mark.parametrize("origin", [ORIGIN, "HTTPS://Places.Example.Test", ORIGIN + "/"])
 def test_the_configured_origin_passes(world, origin):
-    assert world.post(COFFEE_NEAR_PARK, origin=origin).status == 200
+    assert world.post(NEAR_THE_PARK, origin=origin).status == 200
 
 
 def test_plain_http_origins_are_only_for_local_hosts(search_mod):
@@ -36,17 +36,17 @@ def test_plain_http_origins_are_only_for_local_hosts(search_mod):
 
 def test_no_origins_configured_refuses_everything(world):
     world.env(PLACES_ALLOWED_ORIGINS=None)
-    assert world.post(COFFEE_NEAR_PARK).status == 403
+    assert world.post(NEAR_THE_PARK).status == 403
 
 
 @pytest.mark.parametrize("content_type", ["text/plain", "application/x-www-form-urlencoded", "", "application/jsonp"])
 def test_non_json_is_415(world, content_type):
-    resp = world.post(COFFEE_NEAR_PARK, content_type=content_type)
+    resp = world.post(NEAR_THE_PARK, content_type=content_type)
     assert resp.status == 415 and resp.code == "invalid"
 
 
 def test_json_with_charset_is_fine(world):
-    assert world.post(COFFEE_NEAR_PARK, content_type="Application/JSON; charset=utf-8").status == 200
+    assert world.post(NEAR_THE_PARK, content_type="Application/JSON; charset=utf-8").status == 200
 
 
 def test_oversized_body_is_413(world):
@@ -56,7 +56,7 @@ def test_oversized_body_is_413(world):
 
 @pytest.mark.parametrize("length", ["-1", "abc", "1e3"])
 def test_bad_content_length_is_400(world, length):
-    resp = world.post(COFFEE_NEAR_PARK, headers={"Content-Length": length})
+    resp = world.post(NEAR_THE_PARK, headers={"Content-Length": length})
     assert resp.status == 400
 
 
@@ -68,7 +68,7 @@ def test_unreadable_or_non_object_bodies_are_400(world, raw):
 
 
 def test_responses_are_json_and_not_cacheable(world):
-    for resp in (world.post(COFFEE_NEAR_PARK), world.post({"what": "x"}), world.post(COFFEE_NEAR_PARK, origin=None)):
+    for resp in (world.post(NEAR_THE_PARK), world.post({"what": "x"}), world.post(NEAR_THE_PARK, origin=None)):
         assert resp.headers["Content-Type"] == "application/json; charset=utf-8"
         assert resp.headers["Cache-Control"] == "no-store"
         assert int(resp.headers["Content-Length"]) > 0
@@ -78,8 +78,8 @@ def test_an_unexpected_error_leaks_nothing(world, search_mod, monkeypatch):
     def explode(*args):
         raise RuntimeError("secret detail at /var/task/search.py line 99")
 
-    monkeypatch.setattr(search_mod, "normalize_places", explode)
-    resp = world.post(COFFEE_NEAR_PARK)
+    monkeypatch.setattr(search_mod, "place_from_row", explode)
+    resp = world.post(NEAR_THE_PARK)
     assert resp.status == 503 and resp.code == "unavailable"
     text = json.dumps(resp.json)
     assert "secret" not in text and "Traceback" not in text and "search.py" not in text
@@ -87,6 +87,7 @@ def test_an_unexpected_error_leaks_nothing(world, search_mod, monkeypatch):
 
 def test_logs_never_carry_the_address_or_search_text(world, capsys):
     world.post({"what": "Joe's", "where": "1 Private Lane, Hometown"}, ip="203.0.113.99")
+    assert world.geosearch.count() == 1
     out = capsys.readouterr().out
     assert "203.0.113.99" not in out and "Private Lane" not in out and "Joe" not in out
 

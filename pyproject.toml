@@ -1,7 +1,7 @@
 [project]
 name = "place-finder"
 version = "1.0.0"
-description = "Find nearby places from OpenStreetMap: a Vercel Python function with Postgres caching, pacing and daily limits, and a React map."
+description = "Search places across New York City's five boroughs: Overture Maps data in PostGIS, a Vercel Python function and a React map."
 requires-python = ">=3.12"
 # Runtime dependency of frontend/api/search.py. Vercel installs it from frontend/requirements.txt.
 dependencies = ["psycopg[binary]>=3.1,<4"]
@@ -13,9 +13,15 @@ dev = [
   # Lets the local dev server verify HTTPS certificates with a Python that has no system store.
   "certifi",
 ]
+pipeline = [
+    "certifi>=2026.10.23",
+    "duckdb>=2.0.0",
+]
 
 [tool.uv]
 package = false
+# Locally, sync the test tools and the data pipeline. Vercel installs only frontend/requirements.txt.
+default-groups = ["dev", "pipeline"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

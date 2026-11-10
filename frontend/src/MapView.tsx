@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Circle, CircleMarker, MapContainer, TileLayer, Tooltip } from 'react-leaflet'
 import L from 'leaflet'
 import type { Place } from './api'
+import { NYC_BOUNDS, insideNyc } from './nyc'
 
 // Base map: OpenStreetMap's standard raster tiles, which need no key. Their usage policy
 // (https://operations.osmfoundation.org/policies/tiles/, read 2026-11-09) allows interactive
@@ -15,7 +16,7 @@ const TILE_URL = import.meta.env.VITE_TILE_URL || 'https://tile.openstreetmap.or
 const ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
 
 const RADII = [500, 1000, 1500, 2500] as const
-const START: [number, number] = [40.7308, -73.9973]
+const START: [number, number] = [40.7307, -73.9957] // Greenwich Village
 const ACCENT = '#5eead4'
 
 export interface AreaRequest {
@@ -53,6 +54,7 @@ export default function MapView(props: Props) {
   const { places, center, radius, fit, busy, selectedId, hoveredId, onSelect, onHover, onSearchArea } = props
   const [map, setMap] = useState<L.Map | null>(null)
   const [moved, setMoved] = useState(false)
+  const [overNyc, setOverNyc] = useState(true)
   const markers = useRef(new Map<string, L.CircleMarker>())
   const programmatic = useRef(false)
   const baseline = useRef<{ center: L.LatLng; zoom: number } | null>(null)
@@ -103,6 +105,8 @@ export default function MapView(props: Props) {
   useEffect(() => {
     if (!map) return
     const onMoveEnd = () => {
+      const c = map.getCenter()
+      setOverNyc(insideNyc(c.lat, c.lng))
       const base = baseline.current
       if (programmatic.current || !base) return
       const size = map.getSize()
@@ -132,14 +136,22 @@ export default function MapView(props: Props) {
   }, [hoveredId, selectedId])
 
   function searchArea() {
-    if (!map) return
+    if (!map || !overNyc) return
     const c = map.getCenter().wrap()
     onSearchArea({ lat: c.lat, lng: c.lng, radius: radiusForView(map) })
   }
 
   return (
     <div className="map-wrap">
-      <MapContainer ref={setMap} center={START} zoom={14} className="map" worldCopyJump>
+      <MapContainer
+        ref={setMap}
+        center={START}
+        zoom={14}
+        minZoom={10}
+        maxBounds={NYC_BOUNDS}
+        maxBoundsViscosity={1}
+        className="map"
+      >
         <TileLayer url={TILE_URL} attribution={ATTRIBUTION} maxZoom={19} />
         {center && (
           <Circle
@@ -181,8 +193,13 @@ export default function MapView(props: Props) {
         })}
       </MapContainer>
       {moved && !busy && (
-        <button type="button" className="area-button" onClick={searchArea}>
-          Search this area
+        <button
+          type="button"
+          className="area-button"
+          aria-disabled={!overNyc}
+          onClick={searchArea}
+        >
+          {overNyc ? 'Search this area' : 'Move the map over NYC to search'}
         </button>
       )}
     </div>

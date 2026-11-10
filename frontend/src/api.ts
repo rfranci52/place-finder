@@ -7,11 +7,10 @@ export interface Place {
   category: string
   address: string
   phone: string
-  hours: string
   website: string
+  borough: string
   lat: number
   lng: number
-  osm_url: string
   distance_m: number
 }
 
@@ -26,10 +25,10 @@ export interface SearchResult {
   query: { what: string; term: Term; radius_m: number }
   center: { lat: number; lng: number }
   location: string | null
+  borough: string
   places: Place[]
   truncated: boolean
-  cached: boolean
-  fetched_at: string
+  data_release: string | null
 }
 
 export type SearchInput =
@@ -41,6 +40,7 @@ export type ErrorCode =
   | 'forbidden'
   | 'not_found'
   | 'method_not_allowed'
+  | 'out_of_area'
   | 'rate_limited'
   | 'upstream_busy'
   | 'unavailable'
@@ -59,7 +59,8 @@ export class SearchError extends Error {
 }
 
 const KNOWN_CODES = new Set<ErrorCode>([
-  'invalid', 'forbidden', 'not_found', 'method_not_allowed', 'rate_limited', 'upstream_busy', 'unavailable',
+  'invalid', 'forbidden', 'not_found', 'method_not_allowed', 'out_of_area', 'rate_limited', 'upstream_busy',
+  'unavailable',
 ])
 const NETWORK_MESSAGE = "Couldn't reach the search service. Check your connection and try again."
 
