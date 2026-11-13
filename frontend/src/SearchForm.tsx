@@ -46,7 +46,7 @@ export default function SearchForm({ what, where, busy, activeTerm, onWhat, onWh
             maxLength={80}
             required
             enterKeyHint="search"
-            placeholder="Neighborhood or address in NYC"
+            placeholder="Neighborhood, address or ZIP code"
           />
         </div>
         <button type="submit" className="primary" aria-disabled={busy}>

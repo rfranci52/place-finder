@@ -208,7 +208,7 @@ export default function App() {
               <summary>How the data and the search work</summary>
               <ul>
                 <li>The places are this site&apos;s own copy of Overture Maps data for the five boroughs, refreshed monthly.</li>
-                <li>Neighborhood names are looked up locally; only street addresses go to NYC GeoSearch, and each answer is kept for 30 days.</li>
+                <li>Neighborhood names and ZIP codes are looked up locally; only street addresses go to NYC GeoSearch, and each answer is kept for 30 days.</li>
                 <li>Each visitor gets a daily allowance of searches and of new address lookups.</li>
               </ul>
             </details>

@@ -10,8 +10,8 @@ from data the site controls.
 ## What it does
 
 - Type **what** (a category such as "pharmacy", or a name such as "Joe's") and **where** (a
-  neighborhood, a park or a street address in NYC), or tap a quick pick: Coffee, Pizza, Pharmacy,
-  Clinic, Grocery, Park.
+  neighborhood, a park, a ZIP code or a street address in NYC), or tap a quick pick: Coffee,
+  Pizza, Pharmacy, Clinic, Grocery, Park.
 - Move the map and choose **Search this area** to search around the map center. The map stays
   over the city, and the button turns itself off when the center leaves the five boroughs.
 - Up to 60 places come back, nearest first, with category, address, borough, phone and website.
@@ -58,7 +58,10 @@ One search, step by step:
    most 2 kilobytes, POST only. `what` is 2 to 40 characters; then either `where` (2 to 80
    characters) or a `lat`/`lng` pair, plus an optional `radius` of 500, 1000, 1500 or 2500 meters.
 2. **Count it** against the visitor's and the site's daily search allowance.
-3. **Find the point.** A typed location is first looked up in NYC's own neighborhood and park
+3. **Find the point.** A location that is only a ZIP code ("10456", "Bronx, NY 10456") comes from
+   a table of ZIP code centers built from the loaded places (see "Refreshing the data"), because
+   GeoSearch has no ZIP code index and matched bare ZIP codes to house numbers elsewhere in the
+   city. Any other typed location is first looked up in NYC's own neighborhood and park
    names (from the 2020 Neighborhood Tabulation Areas, or NTAs), with an optional borough
    ("Chelsea, Staten Island"). Anything else, typically a street address, goes to
    [NYC GeoSearch](https://geosearch.planninglabs.nyc), the City's free geocoder, and its answer
@@ -246,6 +249,18 @@ backup is a deliberate step. To roll back, rename `places` aside, rename `places
 reports a key with no rows, the release renamed a category: update `VOCABULARY` in
 `frontend/api/search.py` and the snapshot in `tests/data/`. Update `DEFAULT_RELEASE` in the
 script once the new release is live.
+
+Then rebuild the ZIP code table and deploy it with the next push:
+
+```sh
+uv run python scripts/build_zip_centers.py --dry-run   # counts per borough, writes nothing
+uv run python scripts/build_zip_centers.py             # rewrites the table at the end of search.py
+```
+
+Each ZIP code's center is the median position of the loaded places that carry it. A ZIP code is
+kept when at least 20 places carry it and its center falls in the borough its first three digits
+imply, which drops codes known only from a few misfiled addresses (233 of 715 seen in release
+2026-10-21.0).
 
 Space: during a refresh two copies exist (about 270 MB) until the backup is removed.
 
